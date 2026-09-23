@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Outfit", "Inter", system-ui, sans-serif;
+
+  /* Brand green scale, anchored to #1CA672 used across Verdant / vendor / delivery apps */
+  --color-brand-50: #F0FDF4;
+  --color-brand-100: #DCFCE7;
+  --color-brand-200: #BBF7D0;
+  --color-brand-300: #86EFAC;
+  --color-brand-400: #4ADE80;
+  --color-brand-500: #22C55E;
+  --color-brand-600: #1CA672;
+  --color-brand-700: #16A34A;
+  --color-brand-800: #158A5C;
+  --color-brand-900: #13845A;
+
+  /* Neutral surfaces & text */
+  --color-ink-900: #101828;
+  --color-ink-800: #1F2937;
+  --color-ink-700: #374151;
+  --color-ink-600: #4B5563;
+  --color-ink-500: #667085;
+  --color-ink-400: #9CA3AF;
+  --color-ink-300: #D1D5DC;
+  --color-ink-200: #E5E7EB;
+  --color-ink-100: #F3F4F6;
+  --color-ink-50: #F9FAFB;
+
+  --color-surface: #FFFFFF;
+  --color-canvas: #F7F9F8;
+
+  /* Status */
+  --color-info: #3B82F6;
+  --color-info-surface: #EFF6FF;
+  --color-warning: #F79009;
+  --color-warning-surface: #FFFAEB;
+  --color-danger: #DC2626;
+  --color-danger-surface: #FEF2F2;
+  --color-success: #16A34A;
+  --color-success-surface: #F0FDF4;
+  --color-violet: #7C3AED;
+  --color-violet-surface: #F5F3FF;
+  --color-orange: #EA580C;
+  --color-orange-surface: #FFF7ED;
+  --color-teal: #0891B2;
+  --color-teal-surface: #ECFEFF;
+  --color-indigo: #4338CA;
+  --color-indigo-surface: #EEF2FF;
+
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
+  --shadow-card-lg: 0 4px 8px rgba(16, 24, 40, 0.04), 0 12px 24px rgba(16, 24, 40, 0.06);
+  --shadow-button: 0 4px 10px rgba(28, 166, 114, 0.28);
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink-800);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-ink-200);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-ink-300);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
