@@ -1,12 +1,12 @@
-// Real backend VendorSettlement (per-order) + aggregated driver payout shapes,
-// used by the admin-wide Settlements & Payouts page.
-import type { VendorSettlementRecord, DriverPayoutSummary } from '@/types';
+// Real backend VendorSettlement (per-order), VendorPayoutBatch (weekly) and
+// aggregated driver payout shapes, used by the admin-wide Settlements & Payouts page.
+import type { VendorSettlementRecord, DriverPayoutSummary, PayoutBatch, PayoutBatchStatus } from '@/types';
 import { ApiError } from '@/lib/api';
 
 export interface ApiVendorSettlement {
   id: string;
   vendorId: string;
-  vendorName: string;
+  vendorName?: string;
   orderId: string;
   orderNumber: string;
   grossAmount: number;
@@ -30,6 +30,48 @@ export function mapVendorSettlement(s: ApiVendorSettlement): VendorSettlementRec
     gstOnCommission: s.gstOnCommission,
     netPayout: s.netPayout,
     settledAt: s.settledAt,
+  };
+}
+
+// The batches endpoint is being introduced alongside this page; accept both the
+// contract's field names (totalGross…) and the raw model's (grossSales…).
+export interface ApiPayoutBatch {
+  id: string;
+  vendorId: string;
+  vendorName?: string;
+  periodStart: string;
+  periodEnd: string;
+  totalGross?: number;
+  grossSales?: number;
+  totalCommission?: number;
+  commission?: number;
+  totalGst?: number;
+  gstOnCommission?: number;
+  netPayout: number;
+  settlementCount?: number;
+  status: PayoutBatchStatus;
+  paidAt?: string;
+  transactionDate?: string;
+  transactionRef?: string;
+  failureReason?: string;
+}
+
+export function mapPayoutBatch(b: ApiPayoutBatch): PayoutBatch {
+  return {
+    id: b.id,
+    vendorId: b.vendorId,
+    vendorName: b.vendorName ?? 'Unknown vendor',
+    periodStart: b.periodStart,
+    periodEnd: b.periodEnd,
+    totalGross: b.totalGross ?? b.grossSales ?? 0,
+    totalCommission: b.totalCommission ?? b.commission ?? 0,
+    totalGst: b.totalGst ?? b.gstOnCommission ?? 0,
+    netPayout: b.netPayout,
+    settlementCount: b.settlementCount ?? 0,
+    status: b.status,
+    paidAt: b.paidAt ?? b.transactionDate,
+    transactionRef: b.transactionRef,
+    failureReason: b.failureReason,
   };
 }
 

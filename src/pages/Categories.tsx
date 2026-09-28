@@ -9,7 +9,6 @@ import {
   Eye,
   EyeOff,
   Layers,
-  Package,
   Loader2,
   AlertTriangle,
 } from 'lucide-react';
@@ -17,13 +16,22 @@ import { PageHeader } from '@/components/layout/PageHeader';
 import { Button } from '@/components/ui/Button';
 import { Card, CardBody } from '@/components/ui/Card';
 import { StatusBadge } from '@/components/ui/Badge';
-import { Drawer } from '@/components/ui/Drawer';
+import { Drawer, Modal } from '@/components/ui/Drawer';
 import { Field, Input, Select } from '@/components/ui/Input';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { InlineAlert } from '@/components/ui/InlineAlert';
 import type { Category, CatalogStatus, Subcategory, CategoryVariantConfig } from '@/types';
 import { api, ApiError } from '@/lib/api';
 import { cn } from '@/lib/cn';
+import { VariantTypesEditor } from '@/components/catalog/VariantTypesEditor';
+import {
+  describeVariantConfigs,
+  newVariantType,
+  toDraftVariantTypes,
+  toVariantConfigs,
+  validateVariantTypes,
+  type DraftVariantType,
+} from '@/lib/variantTypes';
 
 const slugify = (value: string) =>
   value
@@ -59,8 +67,6 @@ function gradientFor(id: string): [string, string] {
   return GRADIENT_PALETTE[hashString(id) % GRADIENT_PALETTE.length];
 }
 
-const placeholderImage = (seed: string) => `https://picsum.photos/seed/${slugify(seed)}/200/200`;
-
 // ---------------------------------------------------------------------------
 // Backend shapes (GET /admin/categories) — mapped into the admin panel's local
 // Category/Subcategory types below.
@@ -72,6 +78,7 @@ interface ApiSubcategory {
   imageUrl?: string;
   isActive: boolean;
   variantConfig?: CategoryVariantConfig;
+  variantConfigs?: CategoryVariantConfig[];
 }
 
 interface ApiCategory {
@@ -84,6 +91,7 @@ interface ApiCategory {
   showOnHome: boolean;
   subcategories: ApiSubcategory[];
   variantConfig?: CategoryVariantConfig;
+  variantConfigs?: CategoryVariantConfig[];
 }
 
 function mapCategory(c: ApiCategory): Category {
@@ -91,7 +99,7 @@ function mapCategory(c: ApiCategory): Category {
   return {
     id: c.id,
     name: c.name,
-    image: c.imageUrl || placeholderImage(c.name),
+    image: c.imageUrl ?? '',
     colorFrom,
     colorTo,
     order: c.sortOrder,
@@ -99,6 +107,7 @@ function mapCategory(c: ApiCategory): Category {
     showOnHome: c.showOnHome,
     subcategories: c.subcategories.map((s) => mapSubcategory(s, c.id)),
     variantConfig: c.variantConfig,
+    variantConfigs: c.variantConfigs,
   };
 }
 
@@ -107,10 +116,10 @@ function mapSubcategory(s: ApiSubcategory, categoryId: string): Subcategory {
     id: s.id,
     categoryId,
     name: s.name,
-    image: s.imageUrl || placeholderImage(s.name),
-    productCount: 0, // no backend field yet — not worth a full product fetch from this page
+    image: s.imageUrl ?? '',
     status: s.isActive ? 'active' : 'inactive',
     variantConfig: s.variantConfig,
+    variantConfigs: s.variantConfigs,
   };
 }
 
@@ -118,27 +127,15 @@ function errorMessage(err: unknown, fallback: string): string {
   return err instanceof ApiError ? err.message : fallback;
 }
 
-// 'inherit' means this subcategory has no override and uses the parent category's
-// own variantConfig — distinct from CategoryVariantConfig['kind'], which has no
-// concept of "no override" since it's the shape sent to the backend.
-type SubVariantKind = 'inherit' | CategoryVariantConfig['kind'];
-
 interface DraftSubcategory {
   id: string;
   isNew: boolean;
   name: string;
-  productCount: number;
+  image: string;
   status: CatalogStatus;
-  variantKind: SubVariantKind;
-  variantLabel: string;
-  variantValues: string;
+  /** Empty = no override; the subcategory uses its category's variant types. */
+  variantTypes: DraftVariantType[];
 }
-
-const defaultVariantLabel = (kind: CategoryVariantConfig['kind']) =>
-  kind === 'weight_volume' ? 'Weight/Volume' : 'Size';
-
-const defaultVariantValues = (kind: CategoryVariantConfig['kind']) =>
-  kind === 'weight_volume' ? 'g, kg, ml, L, pcs' : 'XS, S, M, L, XL, XXL';
 
 interface DraftCategory {
   id: string | null;
@@ -150,9 +147,7 @@ interface DraftCategory {
   status: CatalogStatus;
   showOnHome: boolean;
   subcategories: DraftSubcategory[];
-  variantKind: CategoryVariantConfig['kind'];
-  variantLabel: string;
-  variantValues: string;
+  variantTypes: DraftVariantType[];
 }
 
 const emptyDraft = (nextOrder: number): DraftCategory => ({
@@ -165,40 +160,31 @@ const emptyDraft = (nextOrder: number): DraftCategory => ({
   status: 'active',
   showOnHome: true,
   subcategories: [],
-  variantKind: 'weight_volume',
-  variantLabel: 'Weight/Volume',
-  variantValues: 'g, kg, ml, L, pcs',
+  variantTypes: [newVariantType('weight_volume')],
 });
 
-const toDraft = (category: Category): DraftCategory => ({
-  id: category.id,
-  name: category.name,
-  image: category.image,
-  colorFrom: category.colorFrom,
-  colorTo: category.colorTo,
-  order: category.order,
-  status: category.status,
-  showOnHome: category.showOnHome,
-  subcategories: category.subcategories.map((s) => ({
-    id: s.id,
-    isNew: false,
-    name: s.name,
-    productCount: s.productCount,
-    status: s.status,
-    variantKind: s.variantConfig?.kind ?? 'inherit',
-    variantLabel: s.variantConfig?.label ?? defaultVariantLabel(s.variantConfig?.kind ?? 'weight_volume'),
-    variantValues:
-      (s.variantConfig?.kind === 'attribute' ? s.variantConfig.options : s.variantConfig?.units)?.join(', ') ??
-      defaultVariantValues(s.variantConfig?.kind ?? 'weight_volume'),
-  })),
-  variantKind: category.variantConfig?.kind ?? 'weight_volume',
-  variantLabel: category.variantConfig?.label ?? 'Weight/Volume',
-  variantValues: (
-    category.variantConfig?.kind === 'attribute'
-      ? category.variantConfig.options
-      : category.variantConfig?.units
-  )?.join(', ') ?? 'g, kg, ml, L, pcs',
-});
+const toDraft = (category: Category): DraftCategory => {
+  const variantTypes = toDraftVariantTypes(category.variantConfigs, category.variantConfig);
+  return {
+    id: category.id,
+    name: category.name,
+    image: category.image,
+    colorFrom: category.colorFrom,
+    colorTo: category.colorTo,
+    order: category.order,
+    status: category.status,
+    showOnHome: category.showOnHome,
+    subcategories: category.subcategories.map((s) => ({
+      id: s.id,
+      isNew: false,
+      name: s.name,
+      image: s.image,
+      status: s.status,
+      variantTypes: toDraftVariantTypes(s.variantConfigs, s.variantConfig),
+    })),
+    variantTypes: variantTypes.length > 0 ? variantTypes : [newVariantType('weight_volume')],
+  };
+};
 
 export function Categories() {
   const [categoriesState, setCategoriesState] = useState<Category[]>([]);
@@ -213,6 +199,8 @@ export function Categories() {
   const [removedSubIds, setRemovedSubIds] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [drawerError, setDrawerError] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Category | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const [reloadKey, setReloadKey] = useState(0);
 
@@ -261,6 +249,27 @@ export function Categories() {
   };
 
   const closeDrawer = () => setDrawerOpen(false);
+
+  async function reloadCategories() {
+    const data = await api.get<ApiCategory[]>('/admin/categories');
+    setCategoriesState(data.map(mapCategory));
+  }
+
+  async function deleteCategory() {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    setActionError(null);
+    try {
+      await api.delete(`/admin/categories/${deleteTarget.id}`);
+      setCategoriesState((prev) => prev.filter((c) => c.id !== deleteTarget.id));
+      setDeleteTarget(null);
+    } catch (err) {
+      setActionError(errorMessage(err, 'Failed to delete category'));
+      setDeleteTarget(null);
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   const toggleExpanded = (id: string) =>
     setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -332,11 +341,9 @@ export function Categories() {
           id: `sub-${slugify(name)}-${Date.now()}`,
           isNew: true,
           name,
-          productCount: 0,
+          image: '',
           status: 'active',
-          variantKind: 'inherit',
-          variantLabel: '',
-          variantValues: '',
+          variantTypes: [],
         },
       ],
     }));
@@ -367,119 +374,105 @@ export function Categories() {
     }));
   };
 
-  const setDraftSubcategoryVariantKind = (id: string, kind: SubVariantKind) => {
+  const setDraftSubcategoryVariantTypes = (id: string, variantTypes: DraftVariantType[]) => {
     setDraft((prev) => ({
       ...prev,
-      subcategories: prev.subcategories.map((s) =>
-        s.id === id
-          ? {
-              ...s,
-              variantKind: kind,
-              variantLabel: kind === 'inherit' ? '' : defaultVariantLabel(kind),
-              variantValues: kind === 'inherit' ? '' : defaultVariantValues(kind),
-            }
-          : s,
-      ),
+      subcategories: prev.subcategories.map((s) => (s.id === id ? { ...s, variantTypes } : s)),
     }));
   };
 
-  const setDraftSubcategoryVariantField = (id: string, field: 'variantLabel' | 'variantValues', value: string) => {
+  const setDraftSubcategoryImage = (id: string, image: string) => {
     setDraft((prev) => ({
       ...prev,
-      subcategories: prev.subcategories.map((s) => (s.id === id ? { ...s, [field]: value } : s)),
+      subcategories: prev.subcategories.map((s) => (s.id === id ? { ...s, image } : s)),
     }));
   };
 
   async function saveDraft() {
     if (!draft.name.trim()) return;
+    const variantProblem =
+      validateVariantTypes(draft.variantTypes) ??
+      draft.subcategories
+        .map((sub) => {
+          const problem = validateVariantTypes(sub.variantTypes);
+          return problem ? `${sub.name || 'Subcategory'}: ${problem}` : null;
+        })
+        .find(Boolean) ??
+      null;
+    if (variantProblem) {
+      setDrawerError(variantProblem);
+      return;
+    }
     setSaving(true);
     setDrawerError(null);
     try {
-      const variantValues = draft.variantValues
-        .split(',')
-        .map((v) => v.trim())
-        .filter(Boolean);
-      const variantConfig: CategoryVariantConfig = {
-        kind: draft.variantKind,
-        label: draft.variantLabel.trim() || (draft.variantKind === 'weight_volume' ? 'Weight/Volume' : 'Size'),
-        ...(draft.variantKind === 'weight_volume' ? { units: variantValues } : { options: variantValues }),
-      };
-
       const payload = {
         name: draft.name.trim(),
         imageUrl: draft.image.trim() || undefined,
         sortOrder: draft.order,
         isActive: draft.status === 'active',
         showOnHome: draft.showOnHome,
-        variantConfig,
+        variantConfigs: toVariantConfigs(draft.variantTypes),
       };
 
       let categoryId = draft.id;
-      let updated: ApiCategory;
       if (categoryId) {
-        updated = await api.patch<ApiCategory>(`/admin/categories/${categoryId}`, payload);
+        await api.patch<ApiCategory>(`/admin/categories/${categoryId}`, payload);
       } else {
-        updated = await api.post<ApiCategory>('/admin/categories', payload);
-        categoryId = updated.id;
+        const created = await api.post<ApiCategory>('/admin/categories', payload);
+        categoryId = created.id;
+        // The category now exists server-side; if a later subcategory step fails
+        // the drawer must switch to edit mode so a retry doesn't create a duplicate.
+        setDraft((prev) => ({ ...prev, id: created.id }));
       }
 
       for (const subId of removedSubIds) {
-        updated = await api.delete<ApiCategory>(`/admin/categories/${categoryId}/subcategories/${subId}`);
+        await api.delete<ApiCategory>(`/admin/categories/${categoryId}/subcategories/${subId}`);
       }
+      setRemovedSubIds([]);
 
       for (const sub of draft.subcategories) {
         const trimmedName = sub.name.trim();
         if (!trimmedName) continue;
 
-        const subVariantValues = sub.variantValues
-          .split(',')
-          .map((v) => v.trim())
-          .filter(Boolean);
         // null explicitly clears a previously-set override so the subcategory falls
-        // back to the category's own variantConfig; undefined (new subcategory,
-        // never touched) just omits the field.
-        const subVariantConfig: CategoryVariantConfig | null | undefined =
-          sub.variantKind === 'inherit'
-            ? sub.isNew
-              ? undefined
-              : null
-            : {
-                kind: sub.variantKind,
-                label: sub.variantLabel.trim() || defaultVariantLabel(sub.variantKind),
-                ...(sub.variantKind === 'weight_volume' ? { units: subVariantValues } : { options: subVariantValues }),
-              };
+        // back to the category's variant types; undefined (new subcategory, never
+        // touched) just omits the field.
+        const subVariantConfigs: CategoryVariantConfig[] | null | undefined =
+          sub.variantTypes.length > 0 ? toVariantConfigs(sub.variantTypes) : sub.isNew ? undefined : null;
 
+        const imageUrl = sub.image.trim();
         if (sub.isNew) {
-          updated = await api.post<ApiCategory>(`/admin/categories/${categoryId}/subcategories`, {
+          const withSub = await api.post<ApiCategory>(`/admin/categories/${categoryId}/subcategories`, {
             name: trimmedName,
-            variantConfig: subVariantConfig,
+            imageUrl: imageUrl || undefined,
+            variantConfigs: subVariantConfigs,
           });
-          if (sub.status === 'inactive') {
-            const created = updated.subcategories[updated.subcategories.length - 1];
-            if (created) {
-              updated = await api.patch<ApiCategory>(
-                `/admin/categories/${categoryId}/subcategories/${created.id}`,
-                { isActive: false },
-              );
+          const created = withSub.subcategories[withSub.subcategories.length - 1];
+          if (created) {
+            setDraft((prev) => ({
+              ...prev,
+              subcategories: prev.subcategories.map((d) => (d.id === sub.id ? { ...d, id: created.id, isNew: false } : d)),
+            }));
+            if (sub.status === 'inactive') {
+              await api.patch<ApiCategory>(`/admin/categories/${categoryId}/subcategories/${created.id}`, { isActive: false });
             }
           }
         } else {
-          updated = await api.patch<ApiCategory>(`/admin/categories/${categoryId}/subcategories/${sub.id}`, {
+          await api.patch<ApiCategory>(`/admin/categories/${categoryId}/subcategories/${sub.id}`, {
             name: trimmedName,
+            imageUrl,
             isActive: sub.status === 'active',
-            variantConfig: subVariantConfig,
+            variantConfigs: subVariantConfigs,
           });
         }
       }
 
-      const mapped = mapCategory(updated);
-      setCategoriesState((prev) => {
-        const exists = prev.some((c) => c.id === mapped.id);
-        return exists ? prev.map((c) => (c.id === mapped.id ? mapped : c)) : [mapped, ...prev];
-      });
+      await reloadCategories();
       setDrawerOpen(false);
     } catch (err) {
       setDrawerError(errorMessage(err, 'Failed to save category'));
+      reloadCategories().catch(() => {});
     } finally {
       setSaving(false);
     }
@@ -528,16 +521,20 @@ export function Categories() {
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {sortedCategories.map((category) => {
-            const totalProducts = category.subcategories.reduce((sum, s) => sum + s.productCount, 0);
             const isExpanded = !!expanded[category.id];
             return (
               <Card key={category.id} className="flex flex-col overflow-hidden">
                 <div className="relative">
-                  <img
-                    src={category.image}
-                    alt={category.name}
-                    className="h-32 w-full rounded-t-2xl object-cover"
-                  />
+                  {category.image ? (
+                    <img src={category.image} alt={category.name} className="h-32 w-full rounded-t-2xl object-cover" />
+                  ) : (
+                    <div
+                      className="flex h-32 w-full items-center justify-center rounded-t-2xl text-white/80"
+                      style={{ background: `linear-gradient(135deg, ${category.colorFrom}, ${category.colorTo})` }}
+                    >
+                      <Layers size={28} />
+                    </div>
+                  )}
                   <span className="absolute left-3 top-3 flex h-6 w-6 items-center justify-center rounded-full bg-white/90 text-[11px] font-bold text-ink-700 shadow">
                     {category.order}
                   </span>
@@ -564,9 +561,6 @@ export function Categories() {
                     <span className="flex items-center gap-1">
                       <Layers size={13} /> {category.subcategories.length} subcategories
                     </span>
-                    <span className="flex items-center gap-1">
-                      <Package size={13} /> {totalProducts} products
-                    </span>
                   </div>
 
                   <div className="flex items-center gap-2 pt-1">
@@ -581,6 +575,13 @@ export function Categories() {
                     >
                       {category.status === 'active' ? 'Deactivate' : 'Activate'}
                     </Button>
+                    <button
+                      onClick={() => setDeleteTarget(category)}
+                      title="Delete category"
+                      className="flex h-8 w-8 items-center justify-center rounded-lg text-ink-400 hover:bg-danger-surface hover:text-danger"
+                    >
+                      <Trash2 size={14} />
+                    </button>
                     <button
                       onClick={() => toggleExpanded(category.id)}
                       className="ml-auto flex h-8 w-8 items-center justify-center rounded-lg text-ink-400 hover:bg-ink-100 hover:text-ink-700"
@@ -610,7 +611,6 @@ export function Categories() {
                                   )}
                                 />
                                 <span className="truncate font-medium text-ink-700">{sub.name}</span>
-                                <span className="shrink-0 text-ink-400">· {sub.productCount}</span>
                               </div>
                               <div className="flex shrink-0 items-center gap-1">
                                 <button
@@ -719,65 +719,16 @@ export function Categories() {
 
           <div className="space-y-3 rounded-xl border border-ink-200 px-3.5 py-3">
             <div>
-              <p className="text-[13px] font-medium text-ink-800">Product Variant Type</p>
+              <p className="text-[13px] font-medium text-ink-800">Product Variant Types</p>
               <p className="text-[12px] text-ink-500">
-                Controls what unit/size input vendors see when adding a product in this category
+                What vendors can choose when adding a product here. Add several if products differ — e.g. Storage for
+                phones, Colour for cases, and No variants for earbuds. The first one is the default.
               </p>
             </div>
-
-            <Field label="Type">
-              <Select
-                value={draft.variantKind}
-                onChange={(e) => {
-                  const kind = e.target.value as CategoryVariantConfig['kind'];
-                  setDraft((prev) => ({
-                    ...prev,
-                    variantKind: kind,
-                    variantLabel: kind === 'weight_volume' ? 'Weight/Volume' : 'Size',
-                    variantValues: kind === 'weight_volume' ? 'g, kg, ml, L, pcs' : 'XS, S, M, L, XL, XXL',
-                  }));
-                }}
-              >
-                <option value="weight_volume">Weight / Volume (e.g. grocery, personal care)</option>
-                <option value="attribute">Size / Attribute (e.g. fashion, electronics)</option>
-              </Select>
-            </Field>
-
-            <Field label="Field label" hint="Shown to vendors above the unit/size input">
-              <Input
-                value={draft.variantLabel}
-                onChange={(e) => setDraft((prev) => ({ ...prev, variantLabel: e.target.value }))}
-                placeholder="e.g. Weight/Volume or Size"
-              />
-            </Field>
-
-            <Field
-              label={draft.variantKind === 'weight_volume' ? 'Units' : 'Options'}
-              hint="Comma-separated list"
-            >
-              <Input
-                value={draft.variantValues}
-                onChange={(e) => setDraft((prev) => ({ ...prev, variantValues: e.target.value }))}
-                placeholder={draft.variantKind === 'weight_volume' ? 'g, kg, ml, L, pcs' : 'XS, S, M, L, XL'}
-              />
-            </Field>
-
-            {draft.variantValues.trim() && (
-              <div className="flex flex-wrap gap-1.5">
-                {draft.variantValues
-                  .split(',')
-                  .map((v) => v.trim())
-                  .filter(Boolean)
-                  .map((v, i) => (
-                    <span
-                      key={`${v}-${i}`}
-                      className="rounded-full bg-ink-100 px-2.5 py-1 text-[11.5px] font-medium text-ink-700"
-                    >
-                      {v}
-                    </span>
-                  ))}
-              </div>
-            )}
+            <VariantTypesEditor
+              types={draft.variantTypes}
+              onChange={(variantTypes) => setDraft((prev) => ({ ...prev, variantTypes }))}
+            />
           </div>
 
           <div>
@@ -810,7 +761,6 @@ export function Categories() {
                         onChange={(e) => renameDraftSubcategory(sub.id, e.target.value)}
                         className="h-8 text-[13px]"
                       />
-                      <span className="shrink-0 text-[11px] text-ink-400">{sub.productCount} items</span>
                       <button
                         onClick={() => toggleDraftSubcategoryStatus(sub.id)}
                         className="shrink-0 rounded-md p-1.5 text-ink-400 hover:bg-ink-100 hover:text-ink-700"
@@ -827,36 +777,45 @@ export function Categories() {
                       </button>
                     </div>
 
-                    <div className="flex items-center gap-2 pl-0.5">
-                      <Select
-                        value={sub.variantKind}
-                        onChange={(e) =>
-                          setDraftSubcategoryVariantKind(sub.id, e.target.value as SubVariantKind)
-                        }
-                        className="h-8 shrink-0 basis-40 text-[12px]"
-                      >
-                        <option value="inherit">Inherit from category</option>
-                        <option value="weight_volume">Weight / Volume</option>
-                        <option value="attribute">Size / Attribute</option>
-                      </Select>
+                    <Input
+                      value={sub.image}
+                      onChange={(e) => setDraftSubcategoryImage(sub.id, e.target.value)}
+                      placeholder="Image URL (optional)"
+                      className="h-8 text-[12px]"
+                    />
 
-                      {sub.variantKind !== 'inherit' && (
-                        <>
-                          <Input
-                            value={sub.variantLabel}
-                            onChange={(e) => setDraftSubcategoryVariantField(sub.id, 'variantLabel', e.target.value)}
-                            placeholder="Field label"
-                            className="h-8 basis-28 text-[12px]"
-                          />
-                          <Input
-                            value={sub.variantValues}
-                            onChange={(e) => setDraftSubcategoryVariantField(sub.id, 'variantValues', e.target.value)}
-                            placeholder={sub.variantKind === 'weight_volume' ? 'g, kg, ml, L, pcs' : 'XS, S, M, L, XL'}
-                            className="h-8 flex-1 text-[12px]"
-                          />
-                        </>
-                      )}
-                    </div>
+                    {sub.variantTypes.length === 0 ? (
+                      <div className="flex items-center justify-between gap-2 pl-0.5">
+                        <p className="text-[12px] text-ink-500">
+                          Variant types: same as category ({describeVariantConfigs(toVariantConfigs(draft.variantTypes))})
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => setDraftSubcategoryVariantTypes(sub.id, [newVariantType('attribute')])}
+                          className="shrink-0 text-[12px] font-medium text-brand-700 hover:underline"
+                        >
+                          Customise
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between pl-0.5">
+                          <p className="text-[12px] font-medium text-ink-700">Variant types for this subcategory</p>
+                          <button
+                            type="button"
+                            onClick={() => setDraftSubcategoryVariantTypes(sub.id, [])}
+                            className="text-[12px] font-medium text-ink-500 hover:underline"
+                          >
+                            Use category's
+                          </button>
+                        </div>
+                        <VariantTypesEditor
+                          compact
+                          types={sub.variantTypes}
+                          onChange={(variantTypes) => setDraftSubcategoryVariantTypes(sub.id, variantTypes)}
+                        />
+                      </div>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -864,6 +823,27 @@ export function Categories() {
           </div>
         </div>
       </Drawer>
+
+      <Modal
+        open={deleteTarget !== null}
+        onClose={() => !deleting && setDeleteTarget(null)}
+        title="Delete category"
+        footer={
+          <>
+            <Button variant="outline" onClick={() => setDeleteTarget(null)} disabled={deleting}>
+              Cancel
+            </Button>
+            <Button variant="danger" onClick={deleteCategory} loading={deleting}>
+              Delete
+            </Button>
+          </>
+        }
+      >
+        <p className="text-sm text-ink-600">
+          Delete <span className="font-semibold text-ink-800">{deleteTarget?.name}</span> and its{' '}
+          {deleteTarget?.subcategories.length ?? 0} subcategories? The backend refuses if any product still uses this category.
+        </p>
+      </Modal>
     </div>
   );
 }

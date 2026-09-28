@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import {
   ArrowLeft,
-  Star,
   Bike,
   Phone,
   Mail,
@@ -16,6 +15,7 @@ import {
   UserCheck,
   Loader2,
   AlertTriangle,
+  Clock,
 } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Card, CardBody } from '@/components/ui/Card';
@@ -28,11 +28,12 @@ import { Tabs, type TabItem } from '@/components/ui/Tabs';
 import { Modal } from '@/components/ui/Drawer';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { InlineAlert } from '@/components/ui/InlineAlert';
+import { ReasonModal } from '@/components/ui/ReasonModal';
 import { mapDriverPayout, type ApiDriverPayout } from '@/lib/adminSettlements';
 import type { Driver, DriverPayoutSummary, DriverStatus, KycStatus, Order } from '@/types';
 import { ORDER_STATUS_META } from '@/types';
 import { formatCurrency, formatDate, formatDateTime } from '@/lib/format';
-import { api, fetchAllPaginated } from '@/lib/api';
+import { api, fetchAllPaginatedWithMeta, truncationMessage, unwrapList } from '@/lib/api';
 import {
   mapOrder,
   errorMessage,
@@ -42,16 +43,25 @@ import {
   type ApiVendor,
 } from '@/lib/adminOrders';
 import { avatarColorFor } from '@/lib/avatarColor';
+import { resolveAssetUrl } from '@/lib/asset';
+import {
+  DriverApplication,
+  reviewCounts,
+  type DriverApplicationData,
+  type DriverReviewKey,
+} from '@/components/drivers/DriverApplication';
 
-interface ApiDriver extends ApiDriverBase {
-  email?: string;
-  status: DriverStatus;
-  kycStatus: KycStatus;
-  vehicleType?: 'motorbike' | 'scooter' | 'bicycle' | 'other';
-  vehicleDetails?: { registrationNumber?: string };
-  address?: { city?: string };
-  createdAt: string;
-}
+type ApiDriver = ApiDriverBase &
+  Omit<DriverApplicationData, 'phone' | 'fullName' | 'vehicleType'> & {
+    status: DriverStatus;
+    kycStatus: KycStatus;
+    registrationStep?: string;
+    rejectionReason?: string;
+    vehicleType?: 'motorbike' | 'scooter' | 'bicycle' | 'other';
+    createdAt: string;
+  };
+
+type DetailTab = 'application' | 'deliveries' | 'payouts';
 
 function mapDriver(d: ApiDriver): Driver {
   return {
@@ -65,13 +75,16 @@ function mapDriver(d: ApiDriver): Driver {
     zone: d.address?.city ?? '—',
     status: d.status,
     kycStatus: d.kycStatus,
-    // Rating and earnings have no backend source at all — always 0, never fabricated.
-    rating: 0,
-    totalDeliveries: 0,
-    completionRate: 0,
-    earningsThisMonth: 0,
+    registrationStep: d.registrationStep ?? '',
+    rejectionReason: d.rejectionReason,
     joinedAt: d.createdAt,
   };
+}
+
+interface DeliveryStats {
+  assigned: number;
+  delivered: number;
+  completionRate: number;
 }
 
 export function DriverDetail() {
@@ -79,7 +92,8 @@ export function DriverDetail() {
 
   const [driverApi, setDriverApi] = useState<ApiDriver | null>(null);
   const [driverOrders, setDriverOrders] = useState<Order[]>([]);
-  const [deliveryStats, setDeliveryStats] = useState({ totalDeliveries: 0, completionRate: 0 });
+  const [deliveryStats, setDeliveryStats] = useState<DeliveryStats>({ assigned: 0, delivered: 0, completionRate: 0 });
+  const [truncation, setTruncation] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -87,7 +101,8 @@ export function DriverDetail() {
   const [updating, setUpdating] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<'deliveries' | 'payouts'>('deliveries');
+  const [rejectOpen, setRejectOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<DetailTab>('application');
   const [payout, setPayout] = useState<DriverPayoutSummary | null>(null);
 
   useEffect(() => {
@@ -99,32 +114,31 @@ export function DriverDetail() {
       setNotFound(false);
       try {
         const d = await api.get<ApiDriver>(`/admin/drivers/${driverId}`);
-
-        // No driverId filter on /admin/orders and no driver-assignment/payout
-        // system wired up yet — fetching the full order list and filtering
-        // client-side is the only honest way to compute real delivery stats for
-        // a single driver (sanctioned as a one-off cost on the detail page only,
-        // unlike the drivers list which would turn this into an N+1 fetch).
-        const [allOrders, customers, vendors, payouts] = await Promise.all([
-          fetchAllPaginated<ApiOrder>('/admin/orders'),
-          api.get<ApiCustomer[]>('/admin/customers'),
-          api.get<ApiVendor[]>('/admin/vendors'),
-          api.get<ApiDriverPayout[]>('/admin/settlements/drivers'),
+        const [ordersRes, payouts] = await Promise.all([
+          fetchAllPaginatedWithMeta<ApiOrder>('/admin/orders', { driverId }),
+          api.get<ApiDriverPayout[] | { items: ApiDriverPayout[] }>('/admin/settlements/drivers'),
+        ]);
+        const ordersRaw = ordersRes.items;
+        const customerIds = Array.from(new Set(ordersRaw.map((o) => o.customerId)));
+        const vendorIds = Array.from(new Set(ordersRaw.map((o) => o.vendorId)));
+        const [customers, vendors] = await Promise.all([
+          customerIds.length ? api.get<ApiCustomer[]>('/admin/customers') : Promise.resolve([] as ApiCustomer[]),
+          vendorIds.length ? api.get<ApiVendor[]>('/admin/vendors') : Promise.resolve([] as ApiVendor[]),
         ]);
         if (cancelled) return;
 
-        const matching = allOrders.filter((o) => o.driverId === driverId);
         const customerById = new Map(customers.map((c) => [c.id, c]));
         const vendorById = new Map(vendors.map((v) => [v.id, v]));
         const driverById = new Map([[d.id, d]]);
 
-        const delivered = matching.filter((o) => o.status === 'delivered').length;
-        const completionRate = matching.length > 0 ? Math.round((delivered / matching.length) * 100) : 0;
+        const delivered = ordersRaw.filter((o) => o.status === 'delivered').length;
+        const completionRate = ordersRaw.length > 0 ? Math.round((delivered / ordersRaw.length) * 100) : 0;
 
         setDriverApi(d);
-        setDriverOrders(matching.slice(0, 25).map((o) => mapOrder(o, customerById, vendorById, driverById)));
-        setDeliveryStats({ totalDeliveries: matching.length, completionRate });
-        const driverPayout = payouts.map(mapDriverPayout).find((p) => p.driverId === driverId);
+        setDriverOrders(ordersRaw.map((o) => mapOrder(o, customerById, vendorById, driverById)));
+        setDeliveryStats({ assigned: ordersRes.total, delivered, completionRate });
+        setTruncation(ordersRes.truncated ? truncationMessage(ordersRes.total, ordersRaw.length) : null);
+        const driverPayout = unwrapList(payouts).map(mapDriverPayout).find((p) => p.driverId === driverId);
         setPayout(driverPayout ?? null);
       } catch (err) {
         if (cancelled) return;
@@ -143,19 +157,38 @@ export function DriverDetail() {
     };
   }, [driverId, reloadKey]);
 
-  const driver = driverApi ? { ...mapDriver(driverApi), ...deliveryStats } : null;
+  const driver = driverApi ? mapDriver(driverApi) : null;
 
-  async function updateStatus(status: DriverStatus) {
+  async function updateStatus(status: DriverStatus, rejectionReason?: string) {
     if (!driverId) return;
     setActionError(null);
     setUpdating(true);
     try {
-      const updated = await api.patch<ApiDriver>(`/admin/drivers/${driverId}/status`, { status });
+      const updated = await api.patch<ApiDriver>(`/admin/drivers/${driverId}/status`, {
+        status,
+        ...(rejectionReason ? { rejectionReason } : {}),
+      });
       setDriverApi(updated);
+      setRejectOpen(false);
+      setConfirmOpen(false);
     } catch (err) {
       setActionError(errorMessage(err, 'Failed to update driver status'));
     } finally {
       setUpdating(false);
+    }
+  }
+
+  async function reviewItem(key: DriverReviewKey, status: 'pending' | 'verified' | 'rejected', note?: string) {
+    if (!driverId) return;
+    setActionError(null);
+    try {
+      const updated = await api.patch<ApiDriver>(`/admin/drivers/${driverId}/reviews/${key}`, {
+        status,
+        ...(note ? { note } : {}),
+      });
+      setDriverApi(updated);
+    } catch (err) {
+      setActionError(errorMessage(err, 'Failed to save the review'));
     }
   }
 
@@ -204,9 +237,13 @@ export function DriverDetail() {
   }
 
   const tabItems: TabItem[] = [
-    { value: 'deliveries', label: 'Recent Deliveries', count: driverOrders.length },
+    { value: 'application', label: 'Application & KYC' },
+    { value: 'deliveries', label: 'Assigned orders', count: driverOrders.length },
     { value: 'payouts', label: 'Payouts', count: payout ? 1 : 0 },
   ];
+
+  const isSubmitted = driver.registrationStep === 'submitted';
+  const review = reviewCounts(driverApi?.reviews);
 
   return (
     <div>
@@ -219,14 +256,32 @@ export function DriverDetail() {
         subtitle={`Delivery partner · ${driver.zone}`}
         actions={
           driver.status === 'pending' ? (
-            <div className="flex items-center gap-2">
-              <Button variant="primary" icon={<CheckCircle2 size={16} />} onClick={() => updateStatus('active')} disabled={updating}>
-                Approve
-              </Button>
-              <Button variant="danger" icon={<XCircle size={16} />} onClick={() => updateStatus('rejected')} disabled={updating}>
-                Reject
-              </Button>
-            </div>
+            isSubmitted ? (
+              <div className="flex items-center gap-2">
+                <span title={review.rejected > 0 ? 'Resolve or undo the rejected items before approving' : undefined}>
+                  <Button
+                    variant="primary"
+                    icon={<CheckCircle2 size={16} />}
+                    onClick={() => updateStatus('active')}
+                    disabled={updating || review.rejected > 0}
+                  >
+                    Approve
+                  </Button>
+                </span>
+                <Button
+                  variant="danger"
+                  icon={<XCircle size={16} />}
+                  onClick={() => (review.rejected > 0 ? updateStatus('rejected') : setRejectOpen(true))}
+                  disabled={updating}
+                >
+                  {review.rejected > 0 ? `Send back (${review.rejected} to fix)` : 'Reject'}
+                </Button>
+              </div>
+            ) : (
+              <span className="rounded-lg bg-ink-100 px-3 py-2 text-[13px] text-ink-500">
+                Registration in progress{driver.registrationStep ? ` · step: ${driver.registrationStep}` : ''}
+              </span>
+            )
           ) : driver.status === 'suspended' ? (
             <Button variant="primary" icon={<UserCheck size={16} />} onClick={() => updateStatus('active')} disabled={updating}>
               Reactivate
@@ -240,10 +295,19 @@ export function DriverDetail() {
       />
 
       {actionError && <InlineAlert message={actionError} className="mb-4" />}
+      {truncation && <InlineAlert tone="warning" message={truncation} className="mb-4" />}
 
       <Card>
         <CardBody className="flex flex-wrap items-start gap-6">
-          <Avatar name={driver.name} color={driver.avatarColor} size={64} />
+          {driverApi?.avatarUrl ? (
+            <img
+              src={resolveAssetUrl(driverApi.avatarUrl)}
+              alt={driver.name}
+              className="h-16 w-16 shrink-0 rounded-full border border-ink-200 object-cover"
+            />
+          ) : (
+            <Avatar name={driver.name} color={driver.avatarColor} size={64} />
+          )}
           <div className="min-w-[220px] flex-1">
             <div className="flex flex-wrap items-center gap-2">
               <h2 className="font-display text-lg font-semibold text-ink-900">{driver.name}</h2>
@@ -268,47 +332,55 @@ export function DriverDetail() {
                 <Calendar size={14} className="text-ink-400" /> Joined {formatDate(driver.joinedAt)}
               </div>
             </div>
+            {driver.status === 'rejected' && driver.rejectionReason && (
+              <p className="mt-3 rounded-lg bg-danger-surface px-3 py-2 text-[13px] text-danger">Rejected: {driver.rejectionReason}</p>
+            )}
           </div>
         </CardBody>
       </Card>
 
       <div className="mt-5 grid grid-cols-2 gap-4 lg:grid-cols-4">
         <StatCard
-          label="Total deliveries"
-          value={driver.totalDeliveries}
+          label="Deliveries completed"
+          value={deliveryStats.delivered}
           icon={<Package size={18} />}
           iconColor="#3B82F6"
           iconSurface="var(--color-info-surface)"
+          trendLabel={`${deliveryStats.assigned} assigned`}
         />
         <StatCard
           label="Completion rate"
-          value={`${driver.completionRate}%`}
+          value={`${deliveryStats.completionRate}%`}
           icon={<CheckCircle2 size={18} />}
           iconColor="#1CA672"
           iconSurface="var(--color-brand-50)"
         />
         <StatCard
-          label="Rating"
-          value={driver.rating}
-          icon={<Star size={18} />}
-          iconColor="#F79009"
-          iconSurface="var(--color-warning-surface)"
-        />
-        <StatCard
-          label="Earnings this month"
-          value={formatCurrency(driver.earningsThisMonth)}
+          label="Total earnings"
+          value={formatCurrency(payout?.totalEarnings ?? 0)}
           icon={<IndianRupee size={18} />}
           iconColor="#7C3AED"
           iconSurface="var(--color-violet-surface)"
         />
+        <StatCard
+          label="Pending payout"
+          value={formatCurrency(payout?.pendingAmount ?? 0)}
+          icon={<Clock size={18} />}
+          iconColor="#F79009"
+          iconSurface="var(--color-warning-surface)"
+        />
       </div>
 
       <div className="mt-5">
-        <Tabs items={tabItems} value={activeTab} onChange={(v) => setActiveTab(v as 'deliveries' | 'payouts')} />
+        <Tabs items={tabItems} value={activeTab} onChange={(v) => setActiveTab(v as DetailTab)} />
       </div>
 
       <Card className="mt-4">
-        {activeTab === 'deliveries' ? (
+        {activeTab === 'application' ? (
+          driverApi && (
+            <DriverApplication driver={driverApi} onReview={isSubmitted ? reviewItem : undefined} />
+          )
+        ) : activeTab === 'deliveries' ? (
           driverOrders.length === 0 ? (
             <EmptyState icon={<Package size={22} />} title="No deliveries yet" description="This driver hasn't been assigned any orders." />
           ) : (
@@ -382,23 +454,29 @@ export function DriverDetail() {
             <Button variant="outline" onClick={() => setConfirmOpen(false)}>
               Cancel
             </Button>
-            <Button
-              variant="danger"
-              onClick={() => {
-                updateStatus('suspended');
-                setConfirmOpen(false);
-              }}
-            >
+            <Button variant="danger" onClick={() => updateStatus('suspended')} loading={updating}>
               Suspend partner
             </Button>
           </>
         }
       >
         <p className="text-sm text-ink-600">
-          {driver.name} will be blocked from accepting new deliveries until reactivated. This action can be
-          undone at any time.
+          {driver.name} will be blocked from accepting new deliveries until reactivated. Their KYC verification is kept
+          as-is.
         </p>
       </Modal>
+
+      <ReasonModal
+        open={rejectOpen}
+        title={`Reject ${driver.name}?`}
+        label="Reason for rejection"
+        hint="Shown to the driver so they know what to fix."
+        placeholder="e.g. Vehicle RC has expired"
+        confirmLabel="Reject driver"
+        busy={updating}
+        onClose={() => setRejectOpen(false)}
+        onConfirm={(reason) => updateStatus('rejected', reason)}
+      />
     </div>
   );
 }

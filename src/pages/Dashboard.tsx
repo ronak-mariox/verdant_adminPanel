@@ -22,7 +22,7 @@ import { CategoryRevenueChart } from '@/components/charts/CategoryRevenueChart';
 import { ORDER_STATUS_META, type Order, type OrderStatus } from '@/types';
 import { formatCurrency, timeAgo } from '@/lib/format';
 import { api } from '@/lib/api';
-import { mapOrder, type ApiCustomer, type ApiDriver, type ApiOrder, type ApiVendor, errorMessage } from '@/lib/adminOrders';
+import { mapOrder, type ApiCustomer, type ApiOrder, type ApiVendor, errorMessage } from '@/lib/adminOrders';
 
 const STATUS_ORDER: OrderStatus[] = [
   'placed', 'accepted', 'preparing', 'ready_for_pickup', 'out_for_delivery', 'delivered', 'cancelled', 'rejected',
@@ -34,7 +34,10 @@ interface ApiDashboard {
   totalOrders: number;
   ordersByStatus: Record<string, number>;
   last30Days: { revenue: number; orders: number };
+  /** Vendors whose application is submitted and awaiting review. */
   pendingVendorApprovals: number;
+  /** Vendors still part-way through the registration wizard (not yet reviewable). */
+  pendingVendorRegistrations?: number;
   pendingProductApprovals: number;
   totalCustomers: number;
   totalActiveVendors: number;
@@ -63,9 +66,8 @@ export function Dashboard() {
         if (cancelled) return;
         const customerById = new Map(customers.map((c) => [c.id, c]));
         const vendorById = new Map(vendors.map((v) => [v.id, v]));
-        const driverById = new Map<string, ApiDriver>();
         setData(dashboard);
-        setRecentOrders(dashboard.recentOrders.map((o) => mapOrder(o, customerById, vendorById, driverById)));
+        setRecentOrders(dashboard.recentOrders.map((o) => mapOrder(o, customerById, vendorById)));
       } catch (err) {
         if (!cancelled) setLoadError(errorMessage(err, 'Failed to load dashboard'));
       } finally {
@@ -114,7 +116,7 @@ export function Dashboard() {
         <>
           <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
             <StatCard
-              label="Revenue (30d)"
+              label="Delivered revenue (30d)"
               value={formatCurrency(data.last30Days.revenue)}
               icon={<IndianRupee size={18} />}
               iconColor="#1CA672"
@@ -147,7 +149,7 @@ export function Dashboard() {
               icon={<Store size={18} />}
               iconColor="#7C3AED"
               iconSurface="var(--color-violet-surface)"
-              trendLabel={`${data.pendingVendorApprovals} pending approval`}
+              trendLabel={`${data.pendingVendorApprovals} awaiting review`}
             />
             <StatCard
               label="Pending products"
@@ -161,10 +163,18 @@ export function Dashboard() {
 
           <div className="mt-6 grid grid-cols-1 gap-5 xl:grid-cols-3">
             <Card className="xl:col-span-2">
-              <CardHeader title="Revenue (last 30 days)" subtitle="No day-by-day trend endpoint yet — showing the aggregate figure" />
+              <CardHeader
+                title="Delivered revenue (last 30 days)"
+                subtitle="Aggregate figure — see Analytics for the day-by-day trend"
+                action={
+                  <Link to="/analytics" className="flex items-center gap-1 text-[12.5px] font-semibold text-brand-700 hover:underline">
+                    Analytics <ArrowRight size={13} />
+                  </Link>
+                }
+              />
               <CardBody className="flex flex-col items-start justify-center gap-2 py-10">
                 <p className="font-display text-4xl font-bold text-ink-900">{formatCurrency(data.last30Days.revenue)}</p>
-                <p className="text-[13px] text-ink-500">across {data.last30Days.orders} non-cancelled orders in the last 30 days</p>
+                <p className="text-[13px] text-ink-500">across {data.last30Days.orders} delivered orders in the last 30 days</p>
               </CardBody>
             </Card>
 
@@ -218,7 +228,10 @@ export function Dashboard() {
                     </div>
                     <div>
                       <p className="text-[13px] font-semibold text-ink-800">Vendor approvals</p>
-                      <p className="text-[12px] text-ink-500">Awaiting review</p>
+                      <p className="text-[12px] text-ink-500">
+                        Submitted, awaiting review
+                        {data.pendingVendorRegistrations !== undefined && ` · ${data.pendingVendorRegistrations} still registering`}
+                      </p>
                     </div>
                   </div>
                   <span className="font-display text-lg font-bold text-ink-900">{data.pendingVendorApprovals}</span>

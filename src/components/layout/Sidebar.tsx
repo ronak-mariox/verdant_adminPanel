@@ -49,11 +49,6 @@ export function Sidebar() {
                     <>
                       <item.icon size={17} strokeWidth={isActive ? 2.4 : 2} />
                       <span className="flex-1">{item.label}</span>
-                      {item.badge ? (
-                        <span className="rounded-full bg-danger px-1.5 py-0.5 text-[10px] font-bold text-white">
-                          {item.badge}
-                        </span>
-                      ) : null}
                     </>
                   )}
                 </NavLink>

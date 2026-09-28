@@ -12,15 +12,16 @@ import { Vendors } from '@/pages/Vendors';
 import { VendorDetail } from '@/pages/VendorDetail';
 import { Drivers } from '@/pages/Drivers';
 import { DriverDetail } from '@/pages/DriverDetail';
+import { Incentives } from '@/pages/Incentives';
 import { Customers } from '@/pages/Customers';
 import { CustomerDetail } from '@/pages/CustomerDetail';
 import { Offers } from '@/pages/Offers';
 import { Settlements } from '@/pages/Settlements';
 import { BankDetailsRequests } from '@/pages/BankDetailsRequests';
 import { Analytics } from '@/pages/Analytics';
-import { Notifications } from '@/pages/Notifications';
 import { Support } from '@/pages/Support';
 import { Settings } from '@/pages/Settings';
+import { NotFound } from '@/pages/NotFound';
 
 export default function App() {
   return (
@@ -39,15 +40,16 @@ export default function App() {
               <Route path="/vendors/:vendorId" element={<VendorDetail />} />
               <Route path="/drivers" element={<Drivers />} />
               <Route path="/drivers/:driverId" element={<DriverDetail />} />
+              <Route path="/incentives" element={<Incentives />} />
               <Route path="/customers" element={<Customers />} />
               <Route path="/customers/:customerId" element={<CustomerDetail />} />
               <Route path="/offers" element={<Offers />} />
               <Route path="/settlements" element={<Settlements />} />
               <Route path="/bank-details-requests" element={<BankDetailsRequests />} />
               <Route path="/analytics" element={<Analytics />} />
-              <Route path="/notifications" element={<Notifications />} />
               <Route path="/support" element={<Support />} />
               <Route path="/settings" element={<Settings />} />
+              <Route path="*" element={<NotFound />} />
             </Route>
           </Route>
         </Routes>

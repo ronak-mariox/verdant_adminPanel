@@ -10,28 +10,33 @@ export type ID = string;
 
 export type CatalogStatus = 'active' | 'inactive';
 
+export type VariantKind = 'weight_volume' | 'attribute' | 'none';
+
 // Determines what unit/variant input the vendor app shows when adding a product
 // under this subcategory (or category, as a fallback) — weight_volume for
 // grocery-style g/kg/ml, attribute for discrete options like clothing sizes or
-// storage capacities.
+// storage capacities, none for items sold as a single piece (e.g. earbuds).
 export interface CategoryVariantConfig {
-  kind: 'weight_volume' | 'attribute';
+  kind: VariantKind;
   label: string;
   units?: string[];
   options?: string[];
+  /** Vendors may type a value that isn't in `options` (attribute kind only). */
+  allowCustom?: boolean;
 }
 
 export interface Subcategory {
   id: ID;
   categoryId: ID;
   name: string;
+  /** Empty when the backend has no image on file — render a neutral placeholder. */
   image: string;
-  productCount: number;
   status: CatalogStatus;
   // Overrides the parent category's variantConfig — e.g. Fashion's "Dresses" needs
   // clothing sizes while its "Watches" subcategory doesn't. Falls back to the
   // category's own variantConfig when unset.
   variantConfig?: CategoryVariantConfig;
+  variantConfigs?: CategoryVariantConfig[];
 }
 
 export interface Category {
@@ -45,8 +50,11 @@ export interface Category {
   showOnHome: boolean;
   subcategories: Subcategory[];
   variantConfig?: CategoryVariantConfig;
+  /** Every variant type a product here may use — the vendor picks one per product. */
+  variantConfigs?: CategoryVariantConfig[];
 }
 
+/** Backend product status, plus two stock-derived states for active products. */
 export type ProductStatus =
   | 'active'
   | 'pending'
@@ -75,8 +83,7 @@ export interface Product {
   sku: string;
   gstRate: number;
   status: ProductStatus;
-  rating: number;
-  ratingCount: number;
+  rejectionReason?: string;
   updatedAt: string;
 }
 
@@ -99,11 +106,9 @@ export interface Vendor {
   address: string;
   status: VendorStatus;
   kycStatus: KycStatus;
-  rating: number;
-  totalOrders: number;
-  revenue: number;
-  commissionRate: number;
-  productsCount: number;
+  /** Raw wizard step — 'submitted' means the application is ready for review. */
+  registrationStep: string;
+  rejectionReason?: string;
   joinedAt: string;
   gstNumber: string;
 }
@@ -112,11 +117,8 @@ export interface Vendor {
 // Delivery partners (drivers)
 // ---------------------------------------------------------------------------
 
-// The backend has no real-time presence/session tracking (no 'online'/'offline'/
-// 'on-delivery' concept) — a driver's only real server-side state is this account
-// status pipeline, mirroring Vendor's. Widened additively from the old mock-only
-// 'online' | 'offline' | 'on-delivery' | 'suspended' union to match backend reality
-// instead of pretending to have live presence data.
+// The backend has no real-time presence/session tracking — a driver's only real
+// server-side state is this account status pipeline, mirroring Vendor's.
 export type DriverStatus = 'pending' | 'active' | 'suspended' | 'rejected';
 
 export interface Driver {
@@ -130,10 +132,8 @@ export interface Driver {
   zone: string;
   status: DriverStatus;
   kycStatus: KycStatus;
-  rating: number;
-  totalDeliveries: number;
-  completionRate: number;
-  earningsThisMonth: number;
+  registrationStep: string;
+  rejectionReason?: string;
   joinedAt: string;
 }
 
@@ -149,17 +149,12 @@ export interface Customer {
   email: string;
   phone: string;
   avatarColor: string;
-  city: string;
   status: CustomerStatus;
-  totalOrders: number;
-  totalSpent: number;
   joinedAt: string;
-  /** Absent when the customer has no orders on record — never fabricated. */
-  lastOrderAt?: string;
 }
 
 // ---------------------------------------------------------------------------
-// Orders — status pipeline mirrors vender_app/src/context/OrdersContext.tsx
+// Orders — status pipeline mirrors backend/src/lib/orderStatus.ts
 // ---------------------------------------------------------------------------
 
 export type OrderStatus =
@@ -183,7 +178,10 @@ export interface OrderItem {
 export interface OrderStatusEvent {
   status: OrderStatus;
   time: string;
+  note?: string;
 }
+
+export type PaymentMethod = 'Cash on Delivery' | 'Online';
 
 export interface Order {
   id: ID;
@@ -203,7 +201,7 @@ export interface Order {
   platformFee: number;
   discount: number;
   total: number;
-  paymentMethod: 'UPI' | 'Card' | 'Cash on Delivery' | 'Wallet';
+  paymentMethod: PaymentMethod;
   paymentStatus: 'paid' | 'pending' | 'refunded' | 'failed';
   status: OrderStatus;
   address: string;
@@ -211,6 +209,7 @@ export interface Order {
   placedAt: string;
   statusHistory: OrderStatusEvent[];
   cancelReason?: string;
+  cancelledBy?: string;
 }
 
 export const ORDER_STATUS_META: Record<
@@ -227,11 +226,23 @@ export const ORDER_STATUS_META: Record<
   rejected: { label: 'Rejected', color: 'var(--color-danger)', surface: 'var(--color-danger-surface)' },
 };
 
+/** Admin-allowed transitions, mirroring backend/src/lib/orderStatus.ts (actor = admin). */
+export const ADMIN_ORDER_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
+  placed: ['accepted', 'rejected', 'cancelled'],
+  accepted: ['preparing', 'cancelled'],
+  preparing: ['ready_for_pickup', 'cancelled'],
+  ready_for_pickup: ['out_for_delivery', 'cancelled'],
+  out_for_delivery: ['delivered', 'ready_for_pickup', 'cancelled'],
+  delivered: [],
+  cancelled: [],
+  rejected: [],
+};
+
+export const TERMINAL_ORDER_STATUSES: OrderStatus[] = ['delivered', 'cancelled', 'rejected'];
+
 // ---------------------------------------------------------------------------
 // Settlements / payouts
 // ---------------------------------------------------------------------------
-
-export type SettlementStatus = 'paid' | 'processing' | 'pending' | 'failed';
 
 // Real, per-order settlement records from `VendorSettlement` on the backend —
 // created once an order is marked delivered. `vendorName` is only populated by
@@ -245,11 +256,32 @@ export interface VendorSettlementRecord {
   orderId: ID;
   orderNumber: string;
   grossAmount: number;
+  /** A fraction (0.08 = 8%). */
   commissionRate: number;
   commissionAmount: number;
   gstOnCommission: number;
   netPayout: number;
   settledAt: string;
+}
+
+export type PayoutBatchStatus = 'pending' | 'paid' | 'failed';
+
+/** Weekly vendor payout batch (`VendorPayoutBatch`) — the only place a "paid" state is tracked. */
+export interface PayoutBatch {
+  id: ID;
+  vendorId: ID;
+  vendorName: string;
+  periodStart: string;
+  periodEnd: string;
+  totalGross: number;
+  totalCommission: number;
+  totalGst: number;
+  netPayout: number;
+  settlementCount: number;
+  status: PayoutBatchStatus;
+  paidAt?: string;
+  transactionRef?: string;
+  failureReason?: string;
 }
 
 // Real, aggregated-per-driver payout summary from the backend's EarningsLedger —
@@ -265,6 +297,31 @@ export interface DriverPayoutSummary {
   totalEarnings: number;
   status: 'pending' | 'processing' | 'paid';
   updatedAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Driver incentives (`Incentive` model)
+// ---------------------------------------------------------------------------
+
+export type IncentiveStatus = 'active' | 'expired';
+
+export interface IncentiveCondition {
+  label: string;
+  type: string;
+  threshold: number;
+}
+
+export interface Incentive {
+  id: ID;
+  title: string;
+  description: string;
+  rewardAmount: number;
+  targetDeliveries: number;
+  startAt: string;
+  expiresAt: string;
+  status: IncentiveStatus;
+  conditions: IncentiveCondition[];
+  createdAt?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -293,18 +350,7 @@ export interface PendingBankDetails {
 }
 
 // ---------------------------------------------------------------------------
-// Vendor KYC document uploads beyond the fixed registration steps
-// ---------------------------------------------------------------------------
-
-export interface AdditionalDocumentData {
-  id: ID;
-  name: string;
-  url: string;
-  uploadedAt: string;
-}
-
-// ---------------------------------------------------------------------------
-// Offers / promotions
+// Offers / promotions (backend `Coupon`)
 // ---------------------------------------------------------------------------
 
 // The backend coupon model has no "scheduled" concept (no startsAt field — a
@@ -314,14 +360,14 @@ export type OfferStatus = 'active' | 'expired' | 'paused';
 
 export interface Offer {
   id: ID;
-  title: string;
   description: string;
   code: string;
-  type: 'percentage' | 'flat' | 'free-delivery';
+  type: 'percentage' | 'flat';
   value: number;
   minOrderValue: number;
-  appliesTo: string;
-  usageCount: number;
+  maxDiscount?: number;
+  usageLimit?: number;
+  usedCount: number;
   status: OfferStatus;
   startDate: string;
   /** Absent when the coupon has no expiry (backend's `expiresAt` is optional) — never fabricated. */
@@ -329,30 +375,17 @@ export interface Offer {
 }
 
 // ---------------------------------------------------------------------------
-// Notifications / announcements sent from admin
-// ---------------------------------------------------------------------------
-
-export type NotificationAudience = 'customers' | 'vendors' | 'drivers' | 'all';
-
-export interface AdminNotification {
-  id: ID;
-  title: string;
-  body: string;
-  audience: NotificationAudience;
-  sentAt: string;
-  reach: number;
-}
-
-// ---------------------------------------------------------------------------
 // Support tickets / disputes
 // ---------------------------------------------------------------------------
 
-export type TicketStatus = 'open' | 'in-progress' | 'resolved' | 'escalated';
+export type TicketStatus = 'open' | 'in_progress' | 'resolved' | 'escalated';
 export type TicketPriority = 'low' | 'medium' | 'high' | 'urgent';
 
-// Real support tickets from the backend's SupportTicket model — currently only
-// ever created when a driver reports a delivery issue (the only real
-// dispute-raising flow that exists today), so the list may be small but is real.
+export interface TicketNote {
+  text: string;
+  at: string;
+}
+
 export interface SupportTicketRecord {
   id: ID;
   subject: string;
@@ -363,6 +396,8 @@ export interface SupportTicketRecord {
   status: TicketStatus;
   description?: string;
   orderId?: ID;
+  notes: TicketNote[];
+  resolvedAt?: string;
   createdAt: string;
   updatedAt: string;
 }

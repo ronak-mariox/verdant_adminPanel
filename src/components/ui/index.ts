@@ -10,3 +10,4 @@ export * from './InlineAlert';
 export * from './Pagination';
 export * from './Drawer';
 export * from './Tabs';
+export * from './ReasonModal';
