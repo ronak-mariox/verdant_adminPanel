@@ -15,8 +15,9 @@ import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Drawer';
 import { InlineAlert } from '@/components/ui/InlineAlert';
 import type { Customer, CustomerStatus } from '@/types';
-import { formatCurrency, formatDate, timeAgo } from '@/lib/format';
-import { api, ApiError } from '@/lib/api';
+import { formatDate } from '@/lib/format';
+import { api, ApiError, buildQuery } from '@/lib/api';
+import { useDebounce } from '@/lib/useDebounce';
 import { avatarColorFor } from '@/lib/avatarColor';
 
 const STATUS_TABS: { value: CustomerStatus | 'all'; label: string }[] = [
@@ -51,20 +52,13 @@ function mapCustomer(c: ApiCustomer): Customer {
     email: c.email ?? '—',
     phone: c.phone,
     avatarColor: avatarColorFor(c.id),
-    // No address/city field on the backend customer record — decorative-only.
-    city: '—',
     status: c.status,
-    // No order-history data server-side yet; computing it here for potentially
-    // many customers would mean an order fetch per row. CustomerDetail.tsx does
-    // this honestly for a single customer instead.
-    totalOrders: 0,
-    totalSpent: 0,
     joinedAt: c.createdAt,
-    lastOrderAt: undefined,
   };
 }
 
 export function Customers() {
+  const [allCustomers, setAllCustomers] = useState<ApiCustomer[]>([]);
   const [apiCustomers, setApiCustomers] = useState<ApiCustomer[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -76,13 +70,29 @@ export function Customers() {
   const [page, setPage] = useState(1);
   const [blockTarget, setBlockTarget] = useState<Customer | null>(null);
 
+  const debouncedSearch = useDebounce(search.trim(), 300);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<ApiCustomer[]>('/admin/customers')
+      .then((data) => {
+        if (!cancelled) setAllCustomers(data);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadKey]);
+
   useEffect(() => {
     let cancelled = false;
     async function load() {
       setLoading(true);
       setLoadError(null);
       try {
-        const data = await api.get<ApiCustomer[]>('/admin/customers');
+        const qs = buildQuery({ status: statusTab === 'all' ? undefined : statusTab, search: debouncedSearch || undefined });
+        const data = await api.get<ApiCustomer[]>(`/admin/customers${qs}`);
         if (!cancelled) setApiCustomers(data);
       } catch (err) {
         if (!cancelled) setLoadError(errorMessage(err, 'Failed to load customers'));
@@ -94,46 +104,22 @@ export function Customers() {
     return () => {
       cancelled = true;
     };
-  }, [reloadKey]);
+  }, [reloadKey, statusTab, debouncedSearch]);
 
   const customers = useMemo(() => apiCustomers.map(mapCustomer), [apiCustomers]);
 
-  const totalCustomers = customers.length;
-  const activeCount = customers.filter((c) => c.status === 'active').length;
-  const blockedCount = customers.filter((c) => c.status === 'blocked').length;
+  const totalCustomers = allCustomers.length;
+  const activeCount = allCustomers.filter((c) => c.status === 'active').length;
+  const blockedCount = allCustomers.filter((c) => c.status === 'blocked').length;
 
-  const searchFiltered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return customers;
-    return customers.filter(
-      (c) =>
-        c.name.toLowerCase().includes(q) ||
-        c.email.toLowerCase().includes(q) ||
-        c.phone.toLowerCase().includes(q) ||
-        c.city.toLowerCase().includes(q),
-    );
-  }, [customers, search]);
-
-  const statusCounts = useMemo(() => {
-    const counts: Record<string, number> = { all: searchFiltered.length };
-    (['active', 'blocked'] as CustomerStatus[]).forEach((s) => {
-      counts[s] = searchFiltered.filter((c) => c.status === s).length;
-    });
-    return counts;
-  }, [searchFiltered]);
-
-  const filtered = useMemo(() => {
-    if (statusTab === 'all') return searchFiltered;
-    return searchFiltered.filter((c) => c.status === statusTab);
-  }, [searchFiltered, statusTab]);
-
-  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const paged = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  const pageCount = Math.max(1, Math.ceil(customers.length / PAGE_SIZE));
+  const currentPage = Math.min(page, pageCount);
+  const paged = customers.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
   const tabItems: TabItem[] = STATUS_TABS.map((t) => ({
     value: t.value,
     label: t.label,
-    count: statusCounts[t.value] ?? 0,
+    count: t.value === 'all' ? totalCustomers : allCustomers.filter((c) => c.status === t.value).length,
   }));
 
   async function setCustomerStatus(id: string, status: CustomerStatus) {
@@ -141,6 +127,7 @@ export function Customers() {
     try {
       const updated = await api.patch<ApiCustomer>(`/admin/customers/${id}/status`, { status });
       setApiCustomers((prev) => prev.map((c) => (c.id === id ? updated : c)));
+      setAllCustomers((prev) => prev.map((c) => (c.id === id ? updated : c)));
     } catch (err) {
       setActionError(errorMessage(err, 'Failed to update customer status'));
     }
@@ -197,7 +184,7 @@ export function Customers() {
       <Card className="mt-4">
         <div className="flex flex-wrap items-center gap-3 border-b border-ink-100 px-5 py-4">
           <SearchInput
-            placeholder="Search by name, email, phone or city…"
+            placeholder="Search by name, email or phone…"
             value={search}
             onChange={(e) => {
               setSearch(e.target.value);
@@ -228,10 +215,6 @@ export function Customers() {
               <Tr>
                 <Th>Customer</Th>
                 <Th>Phone</Th>
-                <Th>City</Th>
-                <Th>Orders</Th>
-                <Th>Total spent</Th>
-                <Th>Last order</Th>
                 <Th>Joined</Th>
                 <Th>Status</Th>
                 <Th className="text-right">Action</Th>
@@ -255,10 +238,6 @@ export function Customers() {
                     </div>
                   </Td>
                   <Td className="text-ink-600">{c.phone}</Td>
-                  <Td className="text-ink-600">{c.city}</Td>
-                  <Td className="text-ink-700">{c.totalOrders}</Td>
-                  <Td className="font-semibold text-ink-800">{formatCurrency(c.totalSpent)}</Td>
-                  <Td className="text-ink-500">{c.lastOrderAt ? timeAgo(c.lastOrderAt) : '—'}</Td>
                   <Td className="text-ink-500">{formatDate(c.joinedAt)}</Td>
                   <Td>
                     <StatusBadge status={c.status} />
@@ -288,10 +267,10 @@ export function Customers() {
 
         {!loading && !loadError && (
           <Pagination
-            page={page}
+            page={currentPage}
             pageCount={pageCount}
             onChange={setPage}
-            total={filtered.length}
+            total={customers.length}
             pageSize={PAGE_SIZE}
           />
         )}

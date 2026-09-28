@@ -4,7 +4,6 @@ import {
   ArrowLeft,
   Mail,
   Phone,
-  MapPin,
   Calendar,
   Clock,
   ShoppingBag,
@@ -29,7 +28,7 @@ import { InlineAlert } from '@/components/ui/InlineAlert';
 import type { Customer, CustomerStatus, Order } from '@/types';
 import { ORDER_STATUS_META } from '@/types';
 import { formatCurrency, formatDate, timeAgo } from '@/lib/format';
-import { api, fetchAllPaginated } from '@/lib/api';
+import { api, fetchAllPaginatedWithMeta, truncationMessage } from '@/lib/api';
 import { mapOrder, errorMessage, type ApiDriver, type ApiOrder, type ApiVendor } from '@/lib/adminOrders';
 import { avatarColorFor } from '@/lib/avatarColor';
 
@@ -49,13 +48,15 @@ function mapCustomer(c: ApiCustomer): Customer {
     email: c.email ?? '—',
     phone: c.phone,
     avatarColor: avatarColorFor(c.id),
-    city: '—',
     status: c.status,
-    totalOrders: 0,
-    totalSpent: 0,
     joinedAt: c.createdAt,
-    lastOrderAt: undefined,
   };
+}
+
+interface OrderStats {
+  totalOrders: number;
+  totalSpent: number;
+  lastOrderAt?: string;
 }
 
 export function CustomerDetail() {
@@ -63,10 +64,8 @@ export function CustomerDetail() {
 
   const [customerApi, setCustomerApi] = useState<ApiCustomer | null>(null);
   const [customerOrders, setCustomerOrders] = useState<Order[]>([]);
-  const [orderStats, setOrderStats] = useState<{ totalOrders: number; totalSpent: number; lastOrderAt?: string }>({
-    totalOrders: 0,
-    totalSpent: 0,
-  });
+  const [orderStats, setOrderStats] = useState<OrderStats>({ totalOrders: 0, totalSpent: 0 });
+  const [truncation, setTruncation] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -84,7 +83,8 @@ export function CustomerDetail() {
       setNotFound(false);
       try {
         const c = await api.get<ApiCustomer>(`/admin/customers/${customerId}`);
-        const ordersRaw = await fetchAllPaginated<ApiOrder>('/admin/orders', { customerId });
+        const ordersRes = await fetchAllPaginatedWithMeta<ApiOrder>('/admin/orders', { customerId });
+        const ordersRaw = ordersRes.items;
 
         const vendorIds = Array.from(new Set(ordersRaw.map((o) => o.vendorId)));
         const driverIds = Array.from(new Set(ordersRaw.map((o) => o.driverId).filter(Boolean))) as string[];
@@ -102,15 +102,17 @@ export function CustomerDetail() {
           .map((o) => mapOrder(o, customerById, vendorById, driverById))
           .sort((a, b) => new Date(b.placedAt).getTime() - new Date(a.placedAt).getTime());
 
-        const totalSpent = mappedOrders.reduce((sum, o) => sum + o.total, 0);
+        // Spend counts delivered orders only — cancelled/rejected orders aren't revenue.
+        const totalSpent = mappedOrders.filter((o) => o.status === 'delivered').reduce((sum, o) => sum + o.total, 0);
 
         setCustomerApi(c);
         setCustomerOrders(mappedOrders);
         setOrderStats({
-          totalOrders: mappedOrders.length,
+          totalOrders: ordersRes.total,
           totalSpent,
           lastOrderAt: mappedOrders[0]?.placedAt,
         });
+        setTruncation(ordersRes.truncated ? truncationMessage(ordersRes.total, ordersRaw.length) : null);
       } catch (err) {
         if (cancelled) return;
         if (err && typeof err === 'object' && 'status' in err && (err as { status: number }).status === 404) {
@@ -128,7 +130,7 @@ export function CustomerDetail() {
     };
   }, [customerId, reloadKey]);
 
-  const customer = customerApi ? { ...mapCustomer(customerApi), ...orderStats } : null;
+  const customer = customerApi ? mapCustomer(customerApi) : null;
 
   async function updateStatus(status: CustomerStatus) {
     if (!customerId) return;
@@ -188,7 +190,8 @@ export function CustomerDetail() {
     );
   }
 
-  const avgOrderValue = customer.totalOrders > 0 ? customer.totalSpent / customer.totalOrders : 0;
+  const deliveredCount = customerOrders.filter((o) => o.status === 'delivered').length;
+  const avgOrderValue = deliveredCount > 0 ? orderStats.totalSpent / deliveredCount : 0;
 
   return (
     <div>
@@ -198,7 +201,7 @@ export function CustomerDetail() {
 
       <PageHeader
         title={customer.name}
-        subtitle={`Customer · ${customer.city}`}
+        subtitle="Customer"
         actions={
           customer.status === 'blocked' ? (
             <Button variant="primary" icon={<UserCheck size={16} />} onClick={() => updateStatus('active')} disabled={updating}>
@@ -213,6 +216,7 @@ export function CustomerDetail() {
       />
 
       {actionError && <InlineAlert message={actionError} className="mb-4" />}
+      {truncation && <InlineAlert tone="warning" message={truncation} className="mb-4" />}
 
       <Card>
         <CardBody className="flex flex-wrap items-start gap-6">
@@ -230,14 +234,11 @@ export function CustomerDetail() {
                 <Phone size={14} className="text-ink-400" /> {customer.phone}
               </div>
               <div className="flex items-center gap-2 text-[13px] text-ink-600">
-                <MapPin size={14} className="text-ink-400" /> {customer.city}
-              </div>
-              <div className="flex items-center gap-2 text-[13px] text-ink-600">
                 <Calendar size={14} className="text-ink-400" /> Joined {formatDate(customer.joinedAt)}
               </div>
               <div className="flex items-center gap-2 text-[13px] text-ink-600">
                 <Clock size={14} className="text-ink-400" /> Last order{' '}
-                {customer.lastOrderAt ? timeAgo(customer.lastOrderAt) : '—'}
+                {orderStats.lastOrderAt ? timeAgo(orderStats.lastOrderAt) : '—'}
               </div>
             </div>
           </div>
@@ -247,14 +248,15 @@ export function CustomerDetail() {
       <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-3">
         <StatCard
           label="Total orders"
-          value={customer.totalOrders}
+          value={orderStats.totalOrders}
           icon={<ShoppingBag size={18} />}
           iconColor="#3B82F6"
           iconSurface="var(--color-info-surface)"
+          trendLabel={`${deliveredCount} delivered`}
         />
         <StatCard
-          label="Total spent"
-          value={formatCurrency(customer.totalSpent)}
+          label="Total spent (delivered)"
+          value={formatCurrency(orderStats.totalSpent)}
           icon={<IndianRupee size={18} />}
           iconColor="#1CA672"
           iconSurface="var(--color-brand-50)"

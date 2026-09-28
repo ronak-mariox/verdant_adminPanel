@@ -10,6 +10,11 @@ export function formatCompactNumber(value: number): string {
   return new Intl.NumberFormat('en-IN', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
 }
 
+/** Formats a fraction (0.08) as a percentage string ("8%"). */
+export function formatPercent(fraction: number, digits = 0): string {
+  return `${(fraction * 100).toFixed(digits)}%`;
+}
+
 export function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
 }
@@ -51,4 +56,9 @@ export function humanizeRole(role: string): string {
     .filter(Boolean)
     .map((part) => part[0]?.toUpperCase() + part.slice(1))
     .join(' ');
+}
+
+/** Formats an ISO timestamp for a `<input type="date">` value. */
+export function toDateInputValue(iso: string): string {
+  return iso ? iso.slice(0, 10) : '';
 }

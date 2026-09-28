@@ -1,140 +1,179 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { Activity, AlertTriangle, CheckCircle2, IndianRupee, Loader2, PackageSearch, XCircle } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Card } from '@/components/ui/Card';
 import { StatCard } from '@/components/ui/StatCard';
 import { StatusBadge } from '@/components/ui/Badge';
 import { Table, Thead, Th, Tr, Td } from '@/components/ui/Table';
-import { SearchInput, Select } from '@/components/ui/Input';
+import { SearchInput } from '@/components/ui/Input';
 import { Tabs, type TabItem } from '@/components/ui/Tabs';
 import { Pagination } from '@/components/ui/Pagination';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Button } from '@/components/ui/Button';
-import { ORDER_STATUS_META, type Order, type OrderStatus } from '@/types';
+import { InlineAlert } from '@/components/ui/InlineAlert';
+import { ORDER_STATUS_META, TERMINAL_ORDER_STATUSES, type Order, type OrderStatus } from '@/types';
 import { formatCurrency, timeAgo } from '@/lib/format';
-import { api, fetchAllPaginated } from '@/lib/api';
+import { api, fetchAllPaginatedWithMeta, fetchPage, truncationMessage } from '@/lib/api';
+import { useDebounce } from '@/lib/useDebounce';
 import { mapOrder, type ApiCustomer, type ApiDriver, type ApiOrder, type ApiVendor, errorMessage } from '@/lib/adminOrders';
 
 const STATUS_ORDER: OrderStatus[] = [
   'placed', 'accepted', 'preparing', 'ready_for_pickup', 'out_for_delivery', 'delivered', 'cancelled', 'rejected',
 ];
 
-const TERMINAL_STATUSES: OrderStatus[] = ['delivered', 'cancelled', 'rejected'];
-
 const PAGE_SIZE = 15;
 
+interface ApiDashboardCounts {
+  totalOrders: number;
+  ordersByStatus: Record<string, number>;
+  last30Days: { revenue: number; orders: number };
+}
+
+interface Lookups {
+  customerById: Map<string, ApiCustomer>;
+  vendorById: Map<string, ApiVendor>;
+  driverById: Map<string, ApiDriver>;
+}
+
+function matchesSearch(o: Order, q: string): boolean {
+  return `${o.orderNumber ?? ''} ${o.id} ${o.customerName} ${o.customerPhone} ${o.vendorName}`.toLowerCase().includes(q);
+}
+
 export function Orders() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const statusFilter = (searchParams.get('status') as OrderStatus | null) ?? 'all';
+  const search = searchParams.get('search') ?? '';
+  const page = Math.max(1, Number(searchParams.get('page')) || 1);
+  const debouncedSearch = useDebounce(search.trim().toLowerCase(), 300);
+
+  const [lookups, setLookups] = useState<Lookups | null>(null);
+  const [counts, setCounts] = useState<ApiDashboardCounts | null>(null);
   const [orders, setOrders] = useState<Order[]>([]);
+  const [total, setTotal] = useState(0);
+  const [truncated, setTruncated] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
 
-  const [statusFilter, setStatusFilter] = useState<'all' | OrderStatus>('all');
-  const [search, setSearch] = useState('');
-  const [cityFilter, setCityFilter] = useState('all');
-  const [page, setPage] = useState(1);
-
+  // Names are resolved client-side (orders carry only ids), so the directories
+  // are loaded once and reused across page/filter changes.
   useEffect(() => {
     let cancelled = false;
-    async function load() {
+    async function loadLookups() {
+      setLoadError(null);
+      try {
+        const [customers, vendors, drivers, dashboard] = await Promise.all([
+          api.get<ApiCustomer[]>('/admin/customers'),
+          api.get<ApiVendor[]>('/admin/vendors'),
+          api.get<ApiDriver[]>('/admin/drivers'),
+          api.get<ApiDashboardCounts>('/admin/dashboard'),
+        ]);
+        if (cancelled) return;
+        setLookups({
+          customerById: new Map(customers.map((c) => [c.id, c])),
+          vendorById: new Map(vendors.map((v) => [v.id, v])),
+          driverById: new Map(drivers.map((d) => [d.id, d])),
+        });
+        setCounts(dashboard);
+      } catch (err) {
+        if (!cancelled) {
+          setLoadError(errorMessage(err, 'Failed to load orders'));
+          setLoading(false);
+        }
+      }
+    }
+    loadLookups();
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadKey]);
+
+  useEffect(() => {
+    if (!lookups) return;
+    let cancelled = false;
+    async function loadOrders() {
       setLoading(true);
       setLoadError(null);
       try {
-        const [apiOrders, customers, vendors] = await Promise.all([
-          fetchAllPaginated<ApiOrder>('/admin/orders'),
-          api.get<ApiCustomer[]>('/admin/customers'),
-          api.get<ApiVendor[]>('/admin/vendors'),
-        ]);
-        const driverIds = Array.from(new Set(apiOrders.map((o) => o.driverId).filter(Boolean))) as string[];
-        const drivers = driverIds.length ? await api.get<ApiDriver[]>('/admin/drivers') : [];
-        if (cancelled) return;
-
-        const customerById = new Map(customers.map((c) => [c.id, c]));
-        const vendorById = new Map(vendors.map((v) => [v.id, v]));
-        const driverById = new Map(drivers.map((d) => [d.id, d]));
-
-        setOrders(apiOrders.map((o) => mapOrder(o, customerById, vendorById, driverById)));
+        const status = statusFilter === 'all' ? undefined : statusFilter;
+        if (debouncedSearch) {
+          // No server-side search on /admin/orders — pull every page for this
+          // status (capped) and match order number / customer / vendor locally.
+          const res = await fetchAllPaginatedWithMeta<ApiOrder>('/admin/orders', { status });
+          if (cancelled) return;
+          const mapped = res.items.map((o) => mapOrder(o, lookups!.customerById, lookups!.vendorById, lookups!.driverById));
+          const matched = mapped.filter((o) => matchesSearch(o, debouncedSearch));
+          setOrders(matched);
+          setTotal(matched.length);
+          setTruncated(res.truncated);
+        } else {
+          const res = await fetchPage<ApiOrder>('/admin/orders', { status, page, limit: PAGE_SIZE });
+          if (cancelled) return;
+          setOrders(res.items.map((o) => mapOrder(o, lookups!.customerById, lookups!.vendorById, lookups!.driverById)));
+          setTotal(res.total);
+          setTruncated(false);
+        }
       } catch (err) {
         if (!cancelled) setLoadError(errorMessage(err, 'Failed to load orders'));
       } finally {
         if (!cancelled) setLoading(false);
       }
     }
-    load();
+    loadOrders();
     return () => {
       cancelled = true;
     };
-  }, [reloadKey]);
-
-  const cities = useMemo(
-    () => Array.from(new Set(orders.map((o) => o.city).filter(Boolean))).sort((a, b) => a.localeCompare(b)),
-    [orders],
-  );
+  }, [lookups, statusFilter, debouncedSearch, page]);
 
   const stats = useMemo(() => {
-    const active = orders.filter((o) => !TERMINAL_STATUSES.includes(o.status)).length;
-    const completed = orders.filter((o) => o.status === 'delivered').length;
-    const cancelledFailed = orders.filter((o) => o.status === 'cancelled' || o.status === 'rejected').length;
-    const totalValue = orders.reduce((sum, o) => sum + o.total, 0);
-    return { active, completed, cancelledFailed, totalValue };
-  }, [orders]);
-
-  const statusCounts = useMemo(() => {
-    const counts: Record<string, number> = {};
-    for (const o of orders) counts[o.status] = (counts[o.status] ?? 0) + 1;
-    return counts;
-  }, [orders]);
+    const byStatus = counts?.ordersByStatus ?? {};
+    const active = STATUS_ORDER.filter((s) => !TERMINAL_ORDER_STATUSES.includes(s)).reduce((sum, s) => sum + (byStatus[s] ?? 0), 0);
+    return {
+      active,
+      completed: byStatus.delivered ?? 0,
+      cancelledFailed: (byStatus.cancelled ?? 0) + (byStatus.rejected ?? 0),
+      revenue30d: counts?.last30Days.revenue ?? 0,
+    };
+  }, [counts]);
 
   const tabItems: TabItem[] = useMemo(
     () => [
-      { value: 'all', label: 'All', count: orders.length },
+      { value: 'all', label: 'All', count: counts?.totalOrders },
       ...STATUS_ORDER.map((status) => ({
         value: status,
         label: ORDER_STATUS_META[status].label,
-        count: statusCounts[status] ?? 0,
+        count: counts?.ordersByStatus[status] ?? 0,
       })),
     ],
-    [orders.length, statusCounts],
+    [counts],
   );
 
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return orders.filter((o) => {
-      if (statusFilter !== 'all' && o.status !== statusFilter) return false;
-      if (cityFilter !== 'all' && o.city !== cityFilter) return false;
-      if (q) {
-        const haystack = `${o.id} ${o.customerName} ${o.vendorName}`.toLowerCase();
-        if (!haystack.includes(q)) return false;
-      }
-      return true;
-    });
-  }, [orders, statusFilter, cityFilter, search]);
+  function updateParams(next: { status?: string; search?: string; page?: number }) {
+    const params = new URLSearchParams(searchParams);
+    if (next.status !== undefined) {
+      if (next.status === 'all') params.delete('status');
+      else params.set('status', next.status);
+    }
+    if (next.search !== undefined) {
+      if (next.search) params.set('search', next.search);
+      else params.delete('search');
+    }
+    if (next.page !== undefined && next.page > 1) params.set('page', String(next.page));
+    else params.delete('page');
+    setSearchParams(params, { replace: true });
+  }
 
-  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const isSearching = debouncedSearch.length > 0;
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const currentPage = Math.min(page, pageCount);
-  const pageOrders = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
-
-  function updateStatusFilter(value: string) {
-    setStatusFilter(value as 'all' | OrderStatus);
-    setPage(1);
-  }
-
-  function updateSearch(value: string) {
-    setSearch(value);
-    setPage(1);
-  }
-
-  function updateCityFilter(value: string) {
-    setCityFilter(value);
-    setPage(1);
-  }
+  const pageOrders = isSearching ? orders.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE) : orders;
 
   return (
     <div>
       <PageHeader
         title="Orders"
-        subtitle={`${orders.length} orders live across the platform`}
+        subtitle={counts ? `${counts.totalOrders.toLocaleString('en-IN')} orders across the platform` : 'All orders across the platform'}
       />
 
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
@@ -146,7 +185,7 @@ export function Orders() {
           iconSurface="var(--color-teal-surface)"
         />
         <StatCard
-          label="Completed"
+          label="Delivered"
           value={stats.completed}
           icon={<CheckCircle2 size={18} />}
           iconColor="#1CA672"
@@ -160,8 +199,8 @@ export function Orders() {
           iconSurface="var(--color-danger-surface)"
         />
         <StatCard
-          label="Total order value"
-          value={formatCurrency(stats.totalValue)}
+          label="Delivered revenue (30d)"
+          value={formatCurrency(stats.revenue30d)}
           icon={<IndianRupee size={18} />}
           iconColor="#F79009"
           iconSurface="var(--color-warning-surface)"
@@ -169,26 +208,22 @@ export function Orders() {
       </div>
 
       <div className="mt-5 overflow-x-auto pb-1">
-        <Tabs items={tabItems} value={statusFilter} onChange={updateStatusFilter} />
+        <Tabs items={tabItems} value={statusFilter} onChange={(v) => updateParams({ status: v, page: 1 })} />
       </div>
 
       <Card className="mt-4">
         <div className="flex flex-wrap items-center gap-3 border-b border-ink-100 px-5 py-4">
           <SearchInput
-            placeholder="Search by order id, customer or vendor…"
+            placeholder="Search by order number, customer or vendor…"
             value={search}
-            onChange={(e) => updateSearch(e.target.value)}
-            className="max-w-xs"
+            onChange={(e) => updateParams({ search: e.target.value, page: 1 })}
+            className="w-full max-w-sm"
           />
-          <Select value={cityFilter} onChange={(e) => updateCityFilter(e.target.value)}>
-            <option value="all">All cities</option>
-            {cities.map((city) => (
-              <option key={city} value={city}>
-                {city}
-              </option>
-            ))}
-          </Select>
         </div>
+
+        {truncated && (
+          <InlineAlert tone="warning" message={truncationMessage(total, orders.length)} className="mx-5 mt-4" />
+        )}
 
         {loading ? (
           <EmptyState icon={<Loader2 size={24} className="animate-spin" />} title="Loading orders…" />
@@ -250,8 +285,8 @@ export function Orders() {
             <Pagination
               page={currentPage}
               pageCount={pageCount}
-              onChange={setPage}
-              total={filtered.length}
+              onChange={(p) => updateParams({ page: p })}
+              total={total}
               pageSize={PAGE_SIZE}
             />
           </>

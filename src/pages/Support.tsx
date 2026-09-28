@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { LifeBuoy, CircleDot, Clock, CheckCircle2, ArrowUpCircle } from 'lucide-react';
+import { LifeBuoy, CircleDot, Clock, CheckCircle2, ArrowUpCircle, MessageSquarePlus } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Card, CardHeader } from '@/components/ui/Card';
 import { StatCard } from '@/components/ui/StatCard';
@@ -10,7 +10,9 @@ import { SearchInput, Select } from '@/components/ui/Input';
 import { Tabs, type TabItem } from '@/components/ui/Tabs';
 import { Pagination } from '@/components/ui/Pagination';
 import { EmptyState } from '@/components/ui/EmptyState';
-import { fetchAllPaginated } from '@/lib/api';
+import { InlineAlert } from '@/components/ui/InlineAlert';
+import { ReasonModal } from '@/components/ui/ReasonModal';
+import { api, fetchAllPaginatedWithMeta, truncationMessage } from '@/lib/api';
 import { mapTicket, errorMessage, type ApiSupportTicket } from '@/lib/adminSupport';
 import type { SupportTicketRecord, TicketPriority, TicketStatus } from '@/types';
 import { timeAgo } from '@/lib/format';
@@ -20,10 +22,19 @@ const PAGE_SIZE = 14;
 const STATUS_TABS: { value: TicketStatus | 'all'; label: string }[] = [
   { value: 'all', label: 'All' },
   { value: 'open', label: 'Open' },
-  { value: 'in-progress', label: 'In Progress' },
+  { value: 'in_progress', label: 'In Progress' },
   { value: 'resolved', label: 'Resolved' },
   { value: 'escalated', label: 'Escalated' },
 ];
+
+const STATUS_OPTIONS: { value: TicketStatus; label: string }[] = [
+  { value: 'open', label: 'Open' },
+  { value: 'in_progress', label: 'In progress' },
+  { value: 'resolved', label: 'Resolved' },
+  { value: 'escalated', label: 'Escalated' },
+];
+
+const PRIORITIES: TicketPriority[] = ['low', 'medium', 'high', 'urgent'];
 
 const PRIORITY_TONE: Record<TicketPriority, 'danger' | 'warning' | 'info' | 'neutral'> = {
   urgent: 'danger',
@@ -42,6 +53,10 @@ export function Support() {
   const [tickets, setTickets] = useState<SupportTicketRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [truncation, setTruncation] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [noteTarget, setNoteTarget] = useState<SupportTicketRecord | null>(null);
 
   const [statusTab, setStatusTab] = useState<TicketStatus | 'all'>('all');
   const [search, setSearch] = useState('');
@@ -54,9 +69,10 @@ export function Support() {
       setLoading(true);
       setLoadError(null);
       try {
-        const raw = await fetchAllPaginated<ApiSupportTicket>('/admin/support-tickets');
+        const raw = await fetchAllPaginatedWithMeta<ApiSupportTicket>('/admin/support-tickets');
         if (cancelled) return;
-        setTickets(raw.map(mapTicket));
+        setTickets(raw.items.map(mapTicket));
+        setTruncation(raw.truncated ? truncationMessage(raw.total, raw.items.length) : null);
       } catch (err) {
         if (!cancelled) setLoadError(errorMessage(err, 'Failed to load support tickets'));
       } finally {
@@ -70,7 +86,7 @@ export function Support() {
   }, []);
 
   const openCount = useMemo(() => tickets.filter((t) => t.status === 'open').length, [tickets]);
-  const inProgressCount = useMemo(() => tickets.filter((t) => t.status === 'in-progress').length, [tickets]);
+  const inProgressCount = useMemo(() => tickets.filter((t) => t.status === 'in_progress').length, [tickets]);
   const resolvedCount = useMemo(() => tickets.filter((t) => t.status === 'resolved').length, [tickets]);
   const escalatedCount = useMemo(() => tickets.filter((t) => t.status === 'escalated').length, [tickets]);
 
@@ -97,6 +113,24 @@ export function Support() {
   function handleTabChange(value: string) {
     setStatusTab(value as TicketStatus | 'all');
     setPage(1);
+  }
+
+  async function updateTicket(
+    ticket: SupportTicketRecord,
+    body: { status?: TicketStatus; priority?: TicketPriority; note?: string },
+  ) {
+    setUpdatingId(ticket.id);
+    setActionError(null);
+    try {
+      const updated = await api.patch<ApiSupportTicket>(`/admin/support-tickets/${ticket.id}`, body);
+      setTickets((prev) => prev.map((t) => (t.id === ticket.id ? mapTicket(updated) : t)));
+      return true;
+    } catch (err) {
+      setActionError(errorMessage(err, 'Failed to update ticket'));
+      return false;
+    } finally {
+      setUpdatingId(null);
+    }
   }
 
   return (
@@ -133,6 +167,9 @@ export function Support() {
           iconSurface="var(--color-danger-surface)"
         />
       </div>
+
+      {actionError && <InlineAlert message={actionError} className="mt-4" />}
+      {truncation && <InlineAlert tone="warning" message={truncation} className="mt-4" />}
 
       <Card className="mt-6">
         <CardHeader title="All tickets" subtitle={`${filtered.length} ticket${filtered.length === 1 ? '' : 's'}`} />
@@ -190,6 +227,7 @@ export function Support() {
                 <Th>Status</Th>
                 <Th>Order</Th>
                 <Th>Updated</Th>
+                <Th>Notes</Th>
               </Tr>
             </Thead>
             <tbody>
@@ -207,12 +245,42 @@ export function Support() {
                   </Td>
                   <Td className="whitespace-nowrap text-ink-500">{t.category}</Td>
                   <Td>
-                    <Badge tone={PRIORITY_TONE[t.priority]} className="capitalize">
-                      {t.priority}
-                    </Badge>
+                    <div className="flex items-center gap-2">
+                      <Badge tone={PRIORITY_TONE[t.priority]} className="capitalize">
+                        {t.priority}
+                      </Badge>
+                      <Select
+                        value={t.priority}
+                        disabled={updatingId === t.id}
+                        onChange={(e) => updateTicket(t, { priority: e.target.value as TicketPriority })}
+                        className="h-8 px-2 text-xs"
+                        aria-label="Change priority"
+                      >
+                        {PRIORITIES.map((p) => (
+                          <option key={p} value={p} className="capitalize">
+                            {p}
+                          </option>
+                        ))}
+                      </Select>
+                    </div>
                   </Td>
                   <Td>
-                    <StatusBadge status={t.status} />
+                    <div className="flex items-center gap-2">
+                      <StatusBadge status={t.status} />
+                      <Select
+                        value={t.status}
+                        disabled={updatingId === t.id}
+                        onChange={(e) => updateTicket(t, { status: e.target.value as TicketStatus })}
+                        className="h-8 px-2 text-xs"
+                        aria-label="Change status"
+                      >
+                        {STATUS_OPTIONS.map((o) => (
+                          <option key={o.value} value={o.value}>
+                            {o.label}
+                          </option>
+                        ))}
+                      </Select>
+                    </div>
                   </Td>
                   <Td>
                     {t.orderId ? (
@@ -224,6 +292,18 @@ export function Support() {
                     )}
                   </Td>
                   <Td className="whitespace-nowrap text-ink-500">{timeAgo(t.updatedAt)}</Td>
+                  <Td>
+                    <button
+                      type="button"
+                      onClick={() => setNoteTarget(t)}
+                      disabled={updatingId === t.id}
+                      title={t.notes.length ? t.notes[t.notes.length - 1].text : 'Add an internal note'}
+                      className="inline-flex items-center gap-1 whitespace-nowrap text-[12px] font-medium text-brand-700 hover:underline disabled:opacity-50"
+                    >
+                      <MessageSquarePlus size={14} />
+                      {t.notes.length > 0 ? `${t.notes.length} note${t.notes.length === 1 ? '' : 's'}` : 'Add note'}
+                    </button>
+                  </Td>
                 </Tr>
               ))}
             </tbody>
@@ -234,6 +314,21 @@ export function Support() {
           <Pagination page={currentPage} pageCount={pageCount} onChange={setPage} total={filtered.length} pageSize={PAGE_SIZE} />
         )}
       </Card>
+
+      <ReasonModal
+        open={noteTarget !== null}
+        title="Add internal note"
+        description={noteTarget ? `Ticket: ${noteTarget.subject}` : undefined}
+        label="Note"
+        confirmLabel="Add note"
+        busy={updatingId !== null}
+        onClose={() => setNoteTarget(null)}
+        onConfirm={async (note) => {
+          if (!noteTarget) return;
+          const ok = await updateTicket(noteTarget, { note });
+          if (ok) setNoteTarget(null);
+        }}
+      />
     </div>
   );
 }

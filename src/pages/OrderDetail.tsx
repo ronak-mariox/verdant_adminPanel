@@ -9,7 +9,14 @@ import { Avatar } from '@/components/ui/Avatar';
 import { Button } from '@/components/ui/Button';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { InlineAlert } from '@/components/ui/InlineAlert';
-import { ORDER_STATUS_META, type Order, type OrderStatus } from '@/types';
+import { ReasonModal } from '@/components/ui/ReasonModal';
+import {
+  ADMIN_ORDER_TRANSITIONS,
+  ORDER_STATUS_META,
+  TERMINAL_ORDER_STATUSES,
+  type Order,
+  type OrderStatus,
+} from '@/types';
 import { formatCurrency, formatDateTime, timeAgo } from '@/lib/format';
 import { api } from '@/lib/api';
 import {
@@ -23,11 +30,7 @@ import {
 } from '@/lib/adminOrders';
 import { cn } from '@/lib/cn';
 
-const ALL_STATUSES: OrderStatus[] = [
-  'placed', 'accepted', 'preparing', 'ready_for_pickup', 'out_for_delivery', 'delivered', 'cancelled', 'rejected',
-];
-
-const TERMINAL_STATUSES: OrderStatus[] = ['delivered', 'cancelled', 'rejected'];
+const NEEDS_REASON: OrderStatus[] = ['cancelled', 'rejected'];
 
 export function OrderDetail() {
   const { orderId } = useParams<{ orderId: string }>();
@@ -40,6 +43,7 @@ export function OrderDetail() {
   const [statusError, setStatusError] = useState<string | null>(null);
   const [updating, setUpdating] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  const [pendingStatus, setPendingStatus] = useState<OrderStatus | null>(null);
 
   useEffect(() => {
     if (!orderId) return;
@@ -50,14 +54,14 @@ export function OrderDetail() {
       setNotFound(false);
       try {
         const o = await api.get<ApiOrder>(`/admin/orders/${orderId}`);
-        const [customer, vendorRecord] = await Promise.all([
-          api.get<ApiCustomer>(`/admin/customers/${o.customerId}`),
-          api.get<ApiVendor>(`/admin/vendors/${o.vendorId}`),
+        const [customer, vendorRecord, driver] = await Promise.all([
+          api.get<ApiCustomer>(`/admin/customers/${o.customerId}`).catch(() => null),
+          api.get<ApiVendor>(`/admin/vendors/${o.vendorId}`).catch(() => null),
+          o.driverId ? api.get<ApiDriver>(`/admin/drivers/${o.driverId}`).catch(() => null) : Promise.resolve(null),
         ]);
-        const driver = o.driverId ? await api.get<ApiDriver>(`/admin/drivers/${o.driverId}`) : undefined;
         if (cancelled) return;
-        const customerById = new Map([[customer.id, customer]]);
-        const vendorById = new Map([[vendorRecord.id, vendorRecord]]);
+        const customerById = new Map(customer ? [[customer.id, customer] as const] : []);
+        const vendorById = new Map(vendorRecord ? [[vendorRecord.id, vendorRecord] as const] : []);
         const driverById = new Map(driver ? [[driver.id, driver] as const] : []);
         setOrder(mapOrder(o, customerById, vendorById, driverById));
         setVendor(vendorRecord);
@@ -78,31 +82,36 @@ export function OrderDetail() {
     };
   }, [orderId, reloadKey]);
 
-  async function handleStatusChange(next: OrderStatus) {
-    if (!order || next === order.status || !orderId) return;
+  async function applyStatus(next: OrderStatus, note?: string) {
+    if (!order || !orderId) return;
     setStatusError(null);
     setUpdating(true);
     try {
-      const updated = await api.patch<ApiOrder>(`/admin/orders/${orderId}/status`, { status: next });
-      const customerById = new Map([[updated.customerId, { id: updated.customerId, phone: order.customerPhone, name: order.customerName }]]);
-      const vendorById = new Map(vendor ? [[vendor.id, vendor] as const] : []);
-      const driverById = new Map<string, ApiDriver>();
-      setOrder((prev) =>
-        prev
-          ? {
-              ...mapOrder(updated, customerById, vendorById, driverById),
-              // keep the already-resolved display names instead of the placeholder maps above
-              customerName: prev.customerName,
-              customerPhone: prev.customerPhone,
-              driverName: prev.driverName,
-            }
-          : prev,
-      );
+      const updated = await api.patch<ApiOrder>(`/admin/orders/${orderId}/status`, { status: next, note: note || undefined });
+      setOrder((prev) => {
+        if (!prev) return prev;
+        const customerById = new Map([[updated.customerId, { id: updated.customerId, phone: prev.customerPhone, name: prev.customerName }]]);
+        const vendorById = new Map(vendor ? [[vendor.id, vendor] as const] : []);
+        const driverById = new Map(
+          updated.driverId && prev.driverName ? [[updated.driverId, { id: updated.driverId, phone: '', fullName: prev.driverName }] as const] : [],
+        );
+        return { ...mapOrder(updated, customerById, vendorById, driverById), vendorName: prev.vendorName };
+      });
+      setPendingStatus(null);
     } catch (err) {
       setStatusError(errorMessage(err, 'Failed to update order status'));
     } finally {
       setUpdating(false);
     }
+  }
+
+  function handleStatusSelect(next: OrderStatus) {
+    if (!order || next === order.status) return;
+    if (NEEDS_REASON.includes(next)) {
+      setPendingStatus(next);
+      return;
+    }
+    applyStatus(next);
   }
 
   if (loading) {
@@ -149,8 +158,9 @@ export function OrderDetail() {
     );
   }
 
-  const isTerminal = TERMINAL_STATUSES.includes(order.status);
-  const showDriver = !!order.driverId && !!order.driverName;
+  const isTerminal = TERMINAL_ORDER_STATUSES.includes(order.status);
+  const nextStatuses = ADMIN_ORDER_TRANSITIONS[order.status];
+  const showDriver = !!order.driverId;
 
   return (
     <div>
@@ -169,15 +179,19 @@ export function OrderDetail() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-[13px] font-medium text-ink-500">Update status</span>
+          <span className="text-[13px] font-medium text-ink-500">Move to</span>
           <Select
-            value={order.status}
-            disabled={updating}
-            onChange={(e) => handleStatusChange(e.target.value as OrderStatus)}
+            value=""
+            disabled={updating || isTerminal || nextStatuses.length === 0}
+            onChange={(e) => handleStatusSelect(e.target.value as OrderStatus)}
           >
-            {ALL_STATUSES.map((s) => (
+            <option value="" disabled>
+              {isTerminal ? 'No further transitions' : 'Select next status…'}
+            </option>
+            {nextStatuses.map((s) => (
               <option key={s} value={s}>
                 {ORDER_STATUS_META[s].label}
+                {s === 'ready_for_pickup' && order.status === 'out_for_delivery' ? ' (reassign)' : ''}
               </option>
             ))}
           </Select>
@@ -187,11 +201,12 @@ export function OrderDetail() {
       {statusError && <InlineAlert message={statusError} className="mb-5" />}
 
       {isTerminal && (
-        <div className="mb-5 flex items-start gap-3 rounded-2xl border border-danger/20 bg-danger-surface px-5 py-4">
-          <AlertTriangle size={18} className="mt-0.5 shrink-0 text-danger" />
+        <div className={cn('mb-5 flex items-start gap-3 rounded-2xl border px-5 py-4', order.status === 'delivered' ? 'border-success/20 bg-success-surface' : 'border-danger/20 bg-danger-surface')}>
+          <AlertTriangle size={18} className={cn('mt-0.5 shrink-0', order.status === 'delivered' ? 'text-success' : 'text-danger')} />
           <div>
-            <p className="text-sm font-semibold text-danger">
-              This order was {order.status === 'cancelled' ? 'cancelled' : order.status === 'rejected' ? 'rejected' : 'delivered'}
+            <p className={cn('text-sm font-semibold', order.status === 'delivered' ? 'text-success' : 'text-danger')}>
+              This order was {order.status}
+              {order.status === 'cancelled' && order.cancelledBy ? ` by ${order.cancelledBy}` : ''}
             </p>
             {order.status !== 'delivered' && (
               <p className="mt-0.5 text-[13px] text-ink-600">
@@ -223,6 +238,7 @@ export function OrderDetail() {
                   <div>
                     <p className="text-[13px] font-semibold text-ink-800">{meta.label}</p>
                     <p className="text-[12px] text-ink-500">{formatDateTime(event.time)}</p>
+                    {event.note && <p className="mt-0.5 max-w-[220px] text-[12px] text-ink-600">{event.note}</p>}
                   </div>
                 </div>
               );
@@ -293,6 +309,12 @@ export function OrderDetail() {
                 <span className="font-semibold text-ink-900">Total</span>
                 <span className="font-bold text-ink-900">{formatCurrency(order.total)}</span>
               </div>
+              <div className="flex items-center justify-between pt-1 text-[12.5px]">
+                <span className="text-ink-500">Payment</span>
+                <span className="flex items-center gap-2 text-ink-700">
+                  {order.paymentMethod} <StatusBadge status={order.paymentStatus} />
+                </span>
+              </div>
             </div>
           </Card>
         </div>
@@ -315,7 +337,7 @@ export function OrderDetail() {
               </div>
               <Link
                 to={`/customers/${order.customerId}`}
-                className={cn('inline-flex items-center gap-1 text-[12.5px] font-semibold text-brand-700 hover:underline')}
+                className="inline-flex items-center gap-1 text-[12.5px] font-semibold text-brand-700 hover:underline"
               >
                 <User size={13} /> View customer profile
               </Link>
@@ -342,14 +364,14 @@ export function OrderDetail() {
           </Card>
 
           <Card>
-            <CardHeader title="Delivery partner" />
+            <CardHeader title="Delivery partner" subtitle="Assigned by the driver app — read-only here" />
             <CardBody>
               {showDriver ? (
                 <div className="space-y-3">
                   <div className="flex items-center gap-3">
-                    <Avatar name={order.driverName!} size={40} />
+                    <Avatar name={order.driverName ?? 'Driver'} size={40} />
                     <div className="min-w-0">
-                      <p className="truncate text-[13.5px] font-semibold text-ink-800">{order.driverName}</p>
+                      <p className="truncate text-[13.5px] font-semibold text-ink-800">{order.driverName ?? order.driverId}</p>
                       <p className="text-[12.5px] text-ink-500">Delivery partner</p>
                     </div>
                   </div>
@@ -366,13 +388,32 @@ export function OrderDetail() {
                     <Bike size={18} />
                   </div>
                   <p className="text-[13px] font-medium text-ink-700">Unassigned</p>
-                  <p className="mt-0.5 text-[12px] text-ink-500">Not yet dispatched for delivery.</p>
+                  <p className="mt-0.5 text-[12px] text-ink-500">Not yet accepted by a delivery partner.</p>
                 </div>
               )}
             </CardBody>
           </Card>
         </div>
       </div>
+
+      <ReasonModal
+        open={pendingStatus !== null}
+        title={pendingStatus === 'rejected' ? 'Reject this order?' : 'Cancel this order?'}
+        description={
+          pendingStatus === 'rejected'
+            ? 'The customer will be notified and stock will be returned to the vendor.'
+            : 'The customer, vendor and any assigned driver will be notified. Stock is returned to the vendor.'
+        }
+        label="Reason"
+        hint="Shown to the customer and vendor."
+        placeholder={pendingStatus === 'rejected' ? 'e.g. Vendor is closed today' : 'e.g. Customer requested cancellation by phone'}
+        confirmLabel={pendingStatus === 'rejected' ? 'Reject order' : 'Cancel order'}
+        required={pendingStatus === 'cancelled'}
+        busy={updating}
+        error={statusError}
+        onClose={() => setPendingStatus(null)}
+        onConfirm={(reason) => pendingStatus && applyStatus(pendingStatus, reason)}
+      />
     </div>
   );
 }

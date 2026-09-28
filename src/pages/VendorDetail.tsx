@@ -17,6 +17,7 @@ import {
   AlertTriangle,
   ImageOff,
   Eye,
+  RotateCcw,
 } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Card, CardHeader } from '@/components/ui/Card';
@@ -28,12 +29,13 @@ import { Button } from '@/components/ui/Button';
 import { Tabs, type TabItem } from '@/components/ui/Tabs';
 import { Modal } from '@/components/ui/Drawer';
 import { EmptyState } from '@/components/ui/EmptyState';
-import { Field } from '@/components/ui/Input';
 import { InlineAlert } from '@/components/ui/InlineAlert';
+import { ReasonModal } from '@/components/ui/ReasonModal';
 import type { KycStatus, Order, ProductStatus, Vendor, VendorSettlementRecord, VendorStatus } from '@/types';
 import { ORDER_STATUS_META } from '@/types';
-import { formatCurrency, formatDate, timeAgo } from '@/lib/format';
-import { api, fetchAllPaginated } from '@/lib/api';
+import { formatCurrency, formatDate, formatPercent, timeAgo } from '@/lib/format';
+import { api, fetchAllPaginatedWithMeta, truncationMessage, unwrapList } from '@/lib/api';
+import { PLATFORM_COMMISSION_RATE } from '@/lib/platform';
 import {
   mapOrder,
   vendorDisplayName,
@@ -48,7 +50,9 @@ import { avatarColorFor } from '@/lib/avatarColor';
 import { resolveAssetUrl } from '@/lib/asset';
 import { cn } from '@/lib/cn';
 
-const ROW_CAP = 15;
+const ROW_STEP = 15;
+/** The per-vendor settlements endpoint returns at most this many (newest first). */
+const SETTLEMENTS_SERVER_CAP = 50;
 
 // ---------------------------------------------------------------------------
 // Backend shapes
@@ -76,6 +80,8 @@ interface ApiVendor extends Omit<ApiVendorBase, 'businessInfo'> {
   email?: string;
   status: VendorStatus;
   kycStatus: KycStatus;
+  registrationStep?: string;
+  rejectionReason?: string;
   businessType?: string;
   businessInfo?: {
     legalName?: string;
@@ -283,7 +289,7 @@ function mapVendorProduct(p: ApiProduct, categoryNameById: Map<string, string>):
   };
 }
 
-function mapVendor(v: ApiVendor, stats: { productsCount: number; totalOrders: number; revenue: number }): Vendor {
+function mapVendor(v: ApiVendor): Vendor {
   const addressLines = [v.businessInfo?.addressLine1, v.businessInfo?.addressLine2].filter(Boolean).join(', ');
   return {
     id: v.id,
@@ -297,18 +303,20 @@ function mapVendor(v: ApiVendor, stats: { productsCount: number; totalOrders: nu
     address: addressLines || v.storeInfo?.storeAddress || '—',
     status: v.status,
     kycStatus: v.kycStatus,
-    // No rating/commission data server-side at all — always 0, never fabricated.
-    rating: 0,
-    commissionRate: 0,
-    totalOrders: stats.totalOrders,
-    revenue: stats.revenue,
-    productsCount: stats.productsCount,
+    registrationStep: v.registrationStep ?? '',
+    rejectionReason: v.rejectionReason,
     joinedAt: v.createdAt,
     gstNumber: v.gstDetails?.gstin ?? '—',
   };
 }
 
-const TERMINAL_NON_REVENUE_STATUSES = new Set(['cancelled', 'rejected']);
+interface VendorStats {
+  productsCount: number;
+  totalOrders: number;
+  deliveredRevenue: number;
+  commissionEarned: number;
+  commissionRate: number;
+}
 
 export function VendorDetail() {
   const { vendorId } = useParams<{ vendorId: string }>();
@@ -317,21 +325,29 @@ export function VendorDetail() {
   const [vendorProducts, setVendorProducts] = useState<VendorProductRow[]>([]);
   const [vendorOrders, setVendorOrders] = useState<Order[]>([]);
   const [vendorSettlementsData, setVendorSettlementsData] = useState<VendorSettlementRecord[]>([]);
+  const [truncation, setTruncation] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [updating, setUpdating] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
-  const [stats, setVendorApiStats] = useState({ productsCount: 0, totalOrders: 0, revenue: 0 });
+  const [stats, setStats] = useState<VendorStats>({
+    productsCount: 0,
+    totalOrders: 0,
+    deliveredRevenue: 0,
+    commissionEarned: 0,
+    commissionRate: PLATFORM_COMMISSION_RATE,
+  });
 
   const [activeTab, setActiveTab] = useState('products');
+  const [visibleRows, setVisibleRows] = useState<Record<string, number>>({ products: ROW_STEP, orders: ROW_STEP, settlements: ROW_STEP });
   const [suspendOpen, setSuspendOpen] = useState(false);
+  const [rejectOpen, setRejectOpen] = useState(false);
 
   const [stepUpdating, setStepUpdating] = useState<RegistrationStepKey | null>(null);
   const [stepError, setStepError] = useState<string | null>(null);
   const [rejectStepKey, setRejectStepKey] = useState<RegistrationStepKey | null>(null);
-  const [rejectNote, setRejectNote] = useState('');
   const [preview, setPreview] = useState<{ url: string; label: string } | null>(null);
 
   useEffect(() => {
@@ -343,12 +359,13 @@ export function VendorDetail() {
       setNotFound(false);
       try {
         const v = await api.get<ApiVendor>(`/admin/vendors/${vendorId}`);
-        const [productsRaw, ordersRaw, categoriesRaw, settlementsRaw] = await Promise.all([
-          fetchAllPaginated<ApiProduct>('/admin/products', { vendorId }),
-          fetchAllPaginated<ApiOrder>('/admin/orders', { vendorId }),
+        const [productsRes, ordersRes, categoriesRaw, settlementsRaw] = await Promise.all([
+          fetchAllPaginatedWithMeta<ApiProduct>('/admin/products', { vendorId }),
+          fetchAllPaginatedWithMeta<ApiOrder>('/admin/orders', { vendorId }),
           api.get<ApiCategory[]>('/admin/categories'),
-          api.get<VendorSettlementRecord[]>(`/admin/vendors/${vendorId}/settlements`),
+          api.get<VendorSettlementRecord[] | { items: VendorSettlementRecord[] }>(`/admin/vendors/${vendorId}/settlements`),
         ]);
+        const ordersRaw = ordersRes.items;
 
         const customerIds = Array.from(new Set(ordersRaw.map((o) => o.customerId)));
         const driverIds = Array.from(new Set(ordersRaw.map((o) => o.driverId).filter(Boolean))) as string[];
@@ -362,16 +379,31 @@ export function VendorDetail() {
         const customerById = new Map(customers.map((c) => [c.id, c]));
         const vendorById = new Map([[v.id, v]]);
         const driverById = new Map(drivers.map((d) => [d.id, d]));
+        const settlements = unwrapList(settlementsRaw);
 
-        const revenue = ordersRaw
-          .filter((o) => !TERMINAL_NON_REVENUE_STATUSES.has(o.status))
+        const deliveredRevenue = ordersRaw
+          .filter((o) => o.status === 'delivered')
           .reduce((sum, o) => sum + o.pricing.grandTotal, 0);
+        const commissionEarned = settlements.reduce((sum, s) => sum + s.commissionAmount, 0);
 
         setVendorApi(v);
-        setVendorProducts(productsRaw.map((p) => mapVendorProduct(p, categoryNameById)));
+        setVendorProducts(productsRes.items.map((p) => mapVendorProduct(p, categoryNameById)));
         setVendorOrders(ordersRaw.map((o) => mapOrder(o, customerById, vendorById, driverById)));
-        setVendorApiStats({ productsCount: productsRaw.length, totalOrders: ordersRaw.length, revenue });
-        setVendorSettlementsData(settlementsRaw);
+        setStats({
+          productsCount: productsRes.total,
+          totalOrders: ordersRes.total,
+          deliveredRevenue,
+          commissionEarned,
+          commissionRate: settlements[0]?.commissionRate ?? PLATFORM_COMMISSION_RATE,
+        });
+        setVendorSettlementsData(settlements);
+        setTruncation(
+          ordersRes.truncated
+            ? truncationMessage(ordersRes.total, ordersRaw.length)
+            : productsRes.truncated
+              ? truncationMessage(productsRes.total, productsRes.items.length)
+              : null,
+        );
       } catch (err) {
         if (cancelled) return;
         if (err && typeof err === 'object' && 'status' in err && (err as { status: number }).status === 404) {
@@ -387,36 +419,27 @@ export function VendorDetail() {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vendorId, reloadKey]);
 
-  const vendor = vendorApi ? mapVendor(vendorApi, stats) : null;
+  const vendor = vendorApi ? mapVendor(vendorApi) : null;
 
-  async function updateStatus(status: VendorStatus) {
+  async function updateStatus(status: VendorStatus, rejectionReason?: string) {
     if (!vendorId) return;
     setActionError(null);
     setUpdating(true);
     try {
-      const updated = await api.patch<ApiVendor>(`/admin/vendors/${vendorId}/status`, { status });
+      const updated = await api.patch<ApiVendor>(`/admin/vendors/${vendorId}/status`, {
+        status,
+        ...(rejectionReason ? { rejectionReason } : {}),
+      });
       setVendorApi(updated);
+      setRejectOpen(false);
+      setSuspendOpen(false);
     } catch (err) {
       setActionError(errorMessage(err, 'Failed to update vendor status'));
     } finally {
       setUpdating(false);
     }
-  }
-
-  function approve() {
-    updateStatus('active');
-  }
-
-  function reject() {
-    updateStatus('rejected');
-  }
-
-  function confirmSuspend() {
-    updateStatus('suspended');
-    setSuspendOpen(false);
   }
 
   async function reviewStep(stepKey: RegistrationStepKey, status: StepReviewStatus, note?: string) {
@@ -427,13 +450,14 @@ export function VendorDetail() {
       const updated = await api.patch<ApiVendor>(`/admin/vendors/${vendorId}/steps/${stepKey}`, { status, note });
       setVendorApi(updated);
       setRejectStepKey(null);
-      setRejectNote('');
     } catch (err) {
       setStepError(errorMessage(err, 'Failed to update step review'));
     } finally {
       setStepUpdating(null);
     }
   }
+
+  const showMore = (tab: string) => setVisibleRows((prev) => ({ ...prev, [tab]: (prev[tab] ?? ROW_STEP) + ROW_STEP }));
 
   if (loading) {
     return (
@@ -487,6 +511,8 @@ export function VendorDetail() {
     { value: 'settlements', label: 'Settlements', count: vendorSettlementsData.length },
   ];
 
+  const isSubmitted = vendor.registrationStep === 'submitted';
+
   return (
     <div>
       <Link to="/vendors" className="mb-4 inline-flex items-center gap-1.5 text-sm font-medium text-ink-500 hover:text-brand-700">
@@ -497,6 +523,7 @@ export function VendorDetail() {
       <PageHeader title={vendor.storeName} subtitle={`Vendor ID: ${vendor.id}`} />
 
       {actionError && <InlineAlert message={actionError} className="mb-4" />}
+      {truncation && <InlineAlert tone="warning" message={truncation} className="mb-4" />}
 
       <Card className="p-6">
         <div className="flex flex-col gap-5 md:flex-row md:items-start md:justify-between">
@@ -523,23 +550,38 @@ export function VendorDetail() {
                   Joined {formatDate(vendor.joinedAt)}
                 </span>
               </div>
+              {vendor.status === 'rejected' && vendor.rejectionReason && (
+                <p className="mt-3 rounded-lg bg-danger-surface px-3 py-2 text-[13px] text-danger">
+                  Rejected: {vendor.rejectionReason}
+                </p>
+              )}
             </div>
           </div>
 
           <div className="flex shrink-0 items-center gap-2">
-            {vendor.status === 'pending' && (
-              <>
-                <Button variant="primary" icon={<CheckCircle2 size={16} />} onClick={approve} disabled={updating}>
-                  Approve vendor
-                </Button>
-                <Button variant="danger" icon={<XCircle size={16} />} onClick={reject} disabled={updating}>
-                  Reject vendor
-                </Button>
-              </>
-            )}
+            {vendor.status === 'pending' &&
+              (isSubmitted ? (
+                <>
+                  <Button variant="primary" icon={<CheckCircle2 size={16} />} onClick={() => updateStatus('active')} disabled={updating}>
+                    Approve vendor
+                  </Button>
+                  <Button variant="danger" icon={<XCircle size={16} />} onClick={() => setRejectOpen(true)} disabled={updating}>
+                    Reject vendor
+                  </Button>
+                </>
+              ) : (
+                <span className="rounded-lg bg-ink-100 px-3 py-2 text-[13px] text-ink-500">
+                  Registration in progress{vendor.registrationStep ? ` · step: ${vendor.registrationStep}` : ''}
+                </span>
+              ))}
             {vendor.status === 'active' && (
               <Button variant="danger" icon={<Ban size={16} />} onClick={() => setSuspendOpen(true)} disabled={updating}>
                 Suspend vendor
+              </Button>
+            )}
+            {vendor.status === 'suspended' && (
+              <Button variant="primary" icon={<RotateCcw size={16} />} onClick={() => updateStatus('active')} disabled={updating}>
+                Reactivate vendor
               </Button>
             )}
           </div>
@@ -579,10 +621,7 @@ export function VendorDetail() {
                       variant="danger"
                       className="h-8! px-3! text-xs!"
                       disabled={busy || status === 'rejected'}
-                      onClick={() => {
-                        setRejectStepKey(def.key);
-                        setRejectNote('');
-                      }}
+                      onClick={() => setRejectStepKey(def.key)}
                     >
                       Reject
                     </Button>
@@ -624,36 +663,37 @@ export function VendorDetail() {
       <div className="mt-5 grid grid-cols-2 gap-4 md:grid-cols-4">
         <StatCard
           label="Total orders"
-          value={vendor.totalOrders.toLocaleString('en-IN')}
+          value={stats.totalOrders.toLocaleString('en-IN')}
           icon={<ShoppingBag size={18} />}
           iconColor="#3B82F6"
           iconSurface="var(--color-info-surface)"
         />
         <StatCard
-          label="Revenue"
-          value={formatCurrency(vendor.revenue)}
+          label="Delivered revenue"
+          value={formatCurrency(stats.deliveredRevenue)}
           icon={<IndianRupee size={18} />}
           iconColor="#1CA672"
           iconSurface="var(--color-brand-50)"
         />
         <StatCard
           label="Products listed"
-          value={vendor.productsCount}
+          value={stats.productsCount}
           icon={<Package size={18} />}
           iconColor="#7C3AED"
           iconSurface="var(--color-violet-surface)"
         />
         <StatCard
-          label="Commission rate"
-          value={`${vendor.commissionRate}%`}
+          label="Commission earned"
+          value={formatCurrency(stats.commissionEarned)}
           icon={<Percent size={18} />}
           iconColor="#F79009"
           iconSurface="var(--color-warning-surface)"
+          trendLabel={`at ${formatPercent(stats.commissionRate)}`}
         />
       </div>
 
       <Card className="mt-5">
-        <CardHeader title="Vendor activity" subtitle="Products, recent orders and settlement history" />
+        <CardHeader title="Vendor activity" subtitle="Products, orders and settlement history" />
         <div className="border-b border-ink-100 px-5 py-4">
           <Tabs items={tabItems} value={activeTab} onChange={setActiveTab} />
         </div>
@@ -662,43 +702,46 @@ export function VendorDetail() {
           vendorProducts.length === 0 ? (
             <EmptyState icon={<Package size={22} />} title="No products listed" description="This vendor hasn't added any products yet." />
           ) : (
-            <Table>
-              <Thead>
-                <Tr>
-                  <Th>Product</Th>
-                  <Th>Category</Th>
-                  <Th>Price</Th>
-                  <Th>Stock</Th>
-                  <Th>Status</Th>
-                </Tr>
-              </Thead>
-              <tbody>
-                {vendorProducts.slice(0, ROW_CAP).map((p) => (
-                  <Tr key={p.id}>
-                    <Td>
-                      <div className="flex items-center gap-3">
-                        {p.image ? (
-                          <img src={p.image} alt={p.name} className="h-10 w-10 shrink-0 rounded-lg object-cover" />
-                        ) : (
-                          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-ink-100 text-ink-300">
-                            <ImageOff size={16} />
-                          </div>
-                        )}
-                        <div className="min-w-0">
-                          <p className="truncate font-medium text-ink-800">{p.name}</p>
-                        </div>
-                      </div>
-                    </Td>
-                    <Td className="whitespace-nowrap">{p.categoryName}</Td>
-                    <Td className="font-semibold text-ink-800">{formatCurrency(p.sellingPrice)}</Td>
-                    <Td>{p.stock}</Td>
-                    <Td>
-                      <StatusBadge status={p.status} />
-                    </Td>
+            <>
+              <Table>
+                <Thead>
+                  <Tr>
+                    <Th>Product</Th>
+                    <Th>Category</Th>
+                    <Th>Price</Th>
+                    <Th>Stock</Th>
+                    <Th>Status</Th>
                   </Tr>
-                ))}
-              </tbody>
-            </Table>
+                </Thead>
+                <tbody>
+                  {vendorProducts.slice(0, visibleRows.products).map((p) => (
+                    <Tr key={p.id}>
+                      <Td>
+                        <div className="flex items-center gap-3">
+                          {p.image ? (
+                            <img src={p.image} alt={p.name} className="h-10 w-10 shrink-0 rounded-lg object-cover" />
+                          ) : (
+                            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-ink-100 text-ink-300">
+                              <ImageOff size={16} />
+                            </div>
+                          )}
+                          <div className="min-w-0">
+                            <p className="truncate font-medium text-ink-800">{p.name}</p>
+                          </div>
+                        </div>
+                      </Td>
+                      <Td className="whitespace-nowrap">{p.categoryName}</Td>
+                      <Td className="font-semibold text-ink-800">{formatCurrency(p.sellingPrice)}</Td>
+                      <Td>{p.stock}</Td>
+                      <Td>
+                        <StatusBadge status={p.status} />
+                      </Td>
+                    </Tr>
+                  ))}
+                </tbody>
+              </Table>
+              <ShowMore shown={Math.min(visibleRows.products, vendorProducts.length)} total={vendorProducts.length} onMore={() => showMore('products')} />
+            </>
           )
         )}
 
@@ -706,34 +749,37 @@ export function VendorDetail() {
           vendorOrders.length === 0 ? (
             <EmptyState icon={<ShoppingBag size={22} />} title="No orders yet" description="This vendor has no orders on record." />
           ) : (
-            <Table>
-              <Thead>
-                <Tr>
-                  <Th>Order</Th>
-                  <Th>Customer</Th>
-                  <Th>Status</Th>
-                  <Th>Total</Th>
-                  <Th>Placed</Th>
-                </Tr>
-              </Thead>
-              <tbody>
-                {vendorOrders.slice(0, ROW_CAP).map((o) => (
-                  <Tr key={o.id}>
-                    <Td>
-                      <Link to={`/orders/${o.id}`} className="font-semibold text-ink-800 hover:text-brand-700">
-                        {o.orderNumber ?? o.id}
-                      </Link>
-                    </Td>
-                    <Td>{o.customerName}</Td>
-                    <Td>
-                      <StatusBadge status={o.status} label={ORDER_STATUS_META[o.status].label} />
-                    </Td>
-                    <Td className="font-semibold text-ink-800">{formatCurrency(o.total)}</Td>
-                    <Td className="text-ink-500">{timeAgo(o.placedAt)}</Td>
+            <>
+              <Table>
+                <Thead>
+                  <Tr>
+                    <Th>Order</Th>
+                    <Th>Customer</Th>
+                    <Th>Status</Th>
+                    <Th>Total</Th>
+                    <Th>Placed</Th>
                   </Tr>
-                ))}
-              </tbody>
-            </Table>
+                </Thead>
+                <tbody>
+                  {vendorOrders.slice(0, visibleRows.orders).map((o) => (
+                    <Tr key={o.id}>
+                      <Td>
+                        <Link to={`/orders/${o.id}`} className="font-semibold text-ink-800 hover:text-brand-700">
+                          {o.orderNumber ?? o.id}
+                        </Link>
+                      </Td>
+                      <Td>{o.customerName}</Td>
+                      <Td>
+                        <StatusBadge status={o.status} label={ORDER_STATUS_META[o.status].label} />
+                      </Td>
+                      <Td className="font-semibold text-ink-800">{formatCurrency(o.total)}</Td>
+                      <Td className="text-ink-500">{timeAgo(o.placedAt)}</Td>
+                    </Tr>
+                  ))}
+                </tbody>
+              </Table>
+              <ShowMore shown={Math.min(visibleRows.orders, vendorOrders.length)} total={vendorOrders.length} onMore={() => showMore('orders')} />
+            </>
           )
         )}
 
@@ -741,34 +787,42 @@ export function VendorDetail() {
           vendorSettlementsData.length === 0 ? (
             <EmptyState icon={<IndianRupee size={22} />} title="No settlements yet" description="Settlements are recorded once an order is marked delivered." />
           ) : (
-            <Table>
-              <Thead>
-                <Tr>
-                  <Th>Order</Th>
-                  <Th>Gross amount</Th>
-                  <Th>Commission</Th>
-                  <Th>GST on commission</Th>
-                  <Th>Net payout</Th>
-                  <Th>Settled</Th>
-                </Tr>
-              </Thead>
-              <tbody>
-                {vendorSettlementsData.slice(0, ROW_CAP).map((s) => (
-                  <Tr key={s.id}>
-                    <Td>
-                      <Link to={`/orders/${s.orderId}`} className="font-semibold text-ink-800 hover:text-brand-700">
-                        {s.orderNumber}
-                      </Link>
-                    </Td>
-                    <Td>{formatCurrency(s.grossAmount)}</Td>
-                    <Td>{formatCurrency(s.commissionAmount)} <span className="text-ink-400">({(s.commissionRate * 100).toFixed(0)}%)</span></Td>
-                    <Td>{formatCurrency(s.gstOnCommission)}</Td>
-                    <Td className="font-semibold text-ink-800">{formatCurrency(s.netPayout)}</Td>
-                    <Td className="text-ink-500">{formatDate(s.settledAt)}</Td>
+            <>
+              <Table>
+                <Thead>
+                  <Tr>
+                    <Th>Order</Th>
+                    <Th>Gross amount</Th>
+                    <Th>Commission</Th>
+                    <Th>GST on commission</Th>
+                    <Th>Net payout</Th>
+                    <Th>Settled</Th>
                   </Tr>
-                ))}
-              </tbody>
-            </Table>
+                </Thead>
+                <tbody>
+                  {vendorSettlementsData.slice(0, visibleRows.settlements).map((s) => (
+                    <Tr key={s.id}>
+                      <Td>
+                        <Link to={`/orders/${s.orderId}`} className="font-semibold text-ink-800 hover:text-brand-700">
+                          {s.orderNumber}
+                        </Link>
+                      </Td>
+                      <Td>{formatCurrency(s.grossAmount)}</Td>
+                      <Td>{formatCurrency(s.commissionAmount)} <span className="text-ink-400">({formatPercent(s.commissionRate)})</span></Td>
+                      <Td>{formatCurrency(s.gstOnCommission)}</Td>
+                      <Td className="font-semibold text-ink-800">{formatCurrency(s.netPayout)}</Td>
+                      <Td className="text-ink-500">{formatDate(s.settledAt)}</Td>
+                    </Tr>
+                  ))}
+                </tbody>
+              </Table>
+              <ShowMore
+                shown={Math.min(visibleRows.settlements, vendorSettlementsData.length)}
+                total={vendorSettlementsData.length}
+                onMore={() => showMore('settlements')}
+                note={vendorSettlementsData.length >= SETTLEMENTS_SERVER_CAP ? `Showing the latest ${SETTLEMENTS_SERVER_CAP} settlements` : undefined}
+              />
+            </>
           )
         )}
       </Card>
@@ -782,47 +836,41 @@ export function VendorDetail() {
             <Button variant="outline" onClick={() => setSuspendOpen(false)}>
               Cancel
             </Button>
-            <Button variant="danger" onClick={confirmSuspend}>
+            <Button variant="danger" onClick={() => updateStatus('suspended')} loading={updating}>
               Suspend vendor
             </Button>
           </>
         }
       >
         <p className="text-sm text-ink-600">
-          {vendor.storeName} will be suspended immediately and removed from the storefront until reinstated. This
-          action can be reversed later.
+          {vendor.storeName} will be suspended immediately and removed from the storefront until reactivated. Their
+          KYC verification is kept as-is.
         </p>
       </Modal>
 
-      <Modal
+      <ReasonModal
+        open={rejectOpen}
+        title={`Reject ${vendor.storeName}?`}
+        description="The vendor will be notified with this reason and can re-apply after fixing the issue."
+        label="Reason for rejection"
+        placeholder="e.g. GST certificate doesn't match the registered business name"
+        confirmLabel="Reject vendor"
+        busy={updating}
+        onClose={() => setRejectOpen(false)}
+        onConfirm={(reason) => updateStatus('rejected', reason)}
+      />
+
+      <ReasonModal
         open={rejectStepKey !== null}
-        onClose={() => setRejectStepKey(null)}
         title={`Reject "${STEP_DEFS.find((s) => s.key === rejectStepKey)?.title ?? ''}"`}
-        footer={
-          <>
-            <Button variant="outline" onClick={() => setRejectStepKey(null)}>
-              Cancel
-            </Button>
-            <Button
-              variant="danger"
-              disabled={!rejectNote.trim() || stepUpdating !== null}
-              onClick={() => rejectStepKey && reviewStep(rejectStepKey, 'rejected', rejectNote.trim())}
-            >
-              Reject step
-            </Button>
-          </>
-        }
-      >
-        <Field label="Reason for rejection" hint="Shown to the vendor so they know what to fix.">
-          <textarea
-            value={rejectNote}
-            onChange={(e) => setRejectNote(e.target.value)}
-            rows={3}
-            placeholder="e.g. Bank account holder name doesn't match GST registered name"
-            className="w-full rounded-xl border border-ink-200 bg-white px-3.5 py-2.5 text-sm text-ink-800 placeholder:text-ink-400 outline-none transition-colors focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
-          />
-        </Field>
-      </Modal>
+        label="Reason for rejection"
+        hint="Shown to the vendor so they know what to fix."
+        placeholder="e.g. Bank account holder name doesn't match GST registered name"
+        confirmLabel="Reject step"
+        busy={stepUpdating !== null}
+        onClose={() => setRejectStepKey(null)}
+        onConfirm={(note) => rejectStepKey && reviewStep(rejectStepKey, 'rejected', note)}
+      />
 
       <Modal open={preview !== null} onClose={() => setPreview(null)} title={preview?.label ?? 'Document'} width={640}>
         {preview && (
@@ -839,6 +887,22 @@ export function VendorDetail() {
           )
         )}
       </Modal>
+    </div>
+  );
+}
+
+function ShowMore({ shown, total, onMore, note }: { shown: number; total: number; onMore: () => void; note?: string }) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-ink-100 px-5 py-3 text-[13px] text-ink-500">
+      <span>
+        Showing {shown} of {total}
+        {note ? ` · ${note}` : ''}
+      </span>
+      {shown < total && (
+        <Button size="sm" variant="outline" onClick={onMore}>
+          Show more
+        </Button>
+      )}
     </div>
   );
 }

@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Plus, Tag, Pause, Play, Pencil, Calendar, Percent, ShoppingBag, Loader2, AlertTriangle } from 'lucide-react';
+import { Plus, Tag, Pause, Play, Pencil, Trash2, Calendar, Percent, Loader2, AlertTriangle } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Card, CardBody } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { StatusBadge } from '@/components/ui/Badge';
 import { Tabs, type TabItem } from '@/components/ui/Tabs';
-import { Drawer } from '@/components/ui/Drawer';
+import { Drawer, Modal } from '@/components/ui/Drawer';
 import { Field, Input, Label } from '@/components/ui/Input';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { InlineAlert } from '@/components/ui/InlineAlert';
@@ -32,13 +32,18 @@ const EMPTY_FORM = {
   type: 'percentage' as EditableOfferType,
   value: '',
   minOrderValue: '',
+  maxDiscount: '',
+  usageLimit: '',
   expiresAt: '',
 };
 
 function valueLabel(offer: Offer) {
-  if (offer.type === 'percentage') return `${offer.value}% OFF`;
-  if (offer.type === 'flat') return `${formatCurrency(offer.value)} OFF`;
-  return 'Free Delivery';
+  return offer.type === 'percentage' ? `${offer.value}% OFF` : `${formatCurrency(offer.value)} OFF`;
+}
+
+function usageLabel(offer: Offer) {
+  const used = offer.usedCount.toLocaleString('en-IN');
+  return offer.usageLimit !== undefined ? `${used} / ${offer.usageLimit.toLocaleString('en-IN')}` : `${used} times`;
 }
 
 function errorMessage(err: unknown, fallback: string): string {
@@ -65,31 +70,23 @@ interface ApiCoupon {
   updatedAt: string;
 }
 
-// Maps a real coupon into the admin panel's local Offer shape:
-//  - title <- the coupon code (always present; the backend has no separate
-//    "title" field distinct from its optional description)
-//  - description <- the real description, or an honest placeholder if absent
-//  - appliesTo <- a fixed "All products" label (coupons are platform-wide
-//    server-side — there's no product/category scoping field to reflect here)
-//  - status <- derived from isActive + whether expiresAt has passed; the
-//    backend has no "scheduled" concept (no separate start date), so that
-//    status was dropped from OfferStatus entirely
-//  - startDate <- createdAt (the coupon is usable from creation)
-//  - endDate <- expiresAt, left undefined (never a fabricated date) when the
-//    coupon has no expiry
+// Maps a real coupon into the admin panel's local Offer shape. Status is derived
+// from isActive + whether expiresAt has passed (the backend has no separate start
+// date, so no "scheduled" state); startDate is createdAt; endDate stays undefined
+// when the coupon never expires.
 function mapCoupon(c: ApiCoupon): Offer {
   const expired = c.expiresAt ? new Date(c.expiresAt).getTime() < Date.now() : false;
   const status: OfferStatus = expired ? 'expired' : c.isActive ? 'active' : 'paused';
   return {
     id: c.id,
-    title: c.code,
-    description: c.description ?? 'No description provided',
+    description: c.description ?? '',
     code: c.code,
     type: c.discountType === 'percent' ? 'percentage' : 'flat',
     value: c.value,
     minOrderValue: c.minOrderValue,
-    appliesTo: 'All products',
-    usageCount: c.usedCount,
+    maxDiscount: c.maxDiscount ?? undefined,
+    usageLimit: c.usageLimit ?? undefined,
+    usedCount: c.usedCount,
     status,
     startDate: c.createdAt,
     endDate: c.expiresAt,
@@ -109,6 +106,8 @@ export function Offers() {
   const [form, setForm] = useState(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [drawerError, setDrawerError] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Offer | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -153,11 +152,13 @@ export function Offers() {
   function openEdit(offer: Offer) {
     setEditingId(offer.id);
     setForm({
-      description: offer.description === 'No description provided' ? '' : offer.description,
+      description: offer.description,
       code: offer.code,
-      type: offer.type === 'percentage' ? 'percentage' : 'flat',
+      type: offer.type,
       value: String(offer.value),
       minOrderValue: String(offer.minOrderValue),
+      maxDiscount: offer.maxDiscount !== undefined ? String(offer.maxDiscount) : '',
+      usageLimit: offer.usageLimit !== undefined ? String(offer.usageLimit) : '',
       expiresAt: offer.endDate ? offer.endDate.slice(0, 10) : '',
     });
     setDrawerError(null);
@@ -175,21 +176,47 @@ export function Offers() {
     }
   }
 
+  async function handleDelete() {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    setActionError(null);
+    try {
+      await api.delete(`/admin/coupons/${deleteTarget.id}`);
+      setCoupons((prev) => prev.filter((c) => c.id !== deleteTarget.id));
+      setDeleteTarget(null);
+    } catch (err) {
+      setActionError(errorMessage(err, 'Failed to delete offer'));
+      setDeleteTarget(null);
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   async function handleSave() {
     if (!form.code.trim()) {
       setDrawerError('Coupon code is required');
       return;
     }
+    if (form.type === 'percentage' && Number(form.value) > 100) {
+      setDrawerError('Percentage discount cannot exceed 100');
+      return;
+    }
     setSaving(true);
     setDrawerError(null);
     try {
+      // On edit, blank optional fields are sent as null so a previously set
+      // limit/expiry can actually be cleared (the PATCH validator accepts null).
+      const optional = (raw: string, parse: (v: string) => number) =>
+        raw.trim() ? parse(raw) : editingId ? null : undefined;
       const payload = {
         code: form.code.trim().toUpperCase(),
         description: form.description.trim() || undefined,
         discountType: form.type === 'percentage' ? ('percent' as const) : ('flat' as const),
         value: Number(form.value) || 0,
         minOrderValue: Number(form.minOrderValue) || 0,
-        expiresAt: form.expiresAt ? new Date(form.expiresAt).toISOString() : undefined,
+        maxDiscount: optional(form.maxDiscount, Number),
+        usageLimit: optional(form.usageLimit, (v) => Math.max(0, Math.floor(Number(v)))),
+        expiresAt: form.expiresAt ? new Date(form.expiresAt).toISOString() : editingId ? null : undefined,
       };
 
       let updated: ApiCoupon;
@@ -263,14 +290,14 @@ export function Offers() {
               <CardBody className="flex flex-1 flex-col gap-3">
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-brand-50 text-brand-700">
-                    {offer.type === 'percentage' ? <Percent size={18} /> : offer.type === 'flat' ? <Tag size={18} /> : <ShoppingBag size={18} />}
+                    {offer.type === 'percentage' ? <Percent size={18} /> : <Tag size={18} />}
                   </div>
                   <StatusBadge status={offer.status} />
                 </div>
 
                 <div>
-                  <h3 className="font-display text-[15px] font-semibold text-ink-900">{offer.title}</h3>
-                  <p className="mt-0.5 text-[13px] text-ink-500">{offer.description}</p>
+                  <h3 className="font-display text-[15px] font-semibold text-ink-900">{offer.code}</h3>
+                  <p className="mt-0.5 text-[13px] text-ink-500">{offer.description || 'No description'}</p>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
@@ -283,10 +310,14 @@ export function Offers() {
                 <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[12.5px] text-ink-500">
                   <span>Min order</span>
                   <span className="text-right font-medium text-ink-700">{formatCurrency(offer.minOrderValue)}</span>
-                  <span>Applies to</span>
-                  <span className="truncate text-right font-medium text-ink-700">{offer.appliesTo}</span>
+                  {offer.maxDiscount !== undefined && (
+                    <>
+                      <span>Max discount</span>
+                      <span className="text-right font-medium text-ink-700">{formatCurrency(offer.maxDiscount)}</span>
+                    </>
+                  )}
                   <span>Used</span>
-                  <span className="text-right font-medium text-ink-700">{offer.usageCount.toLocaleString('en-IN')} times</span>
+                  <span className="text-right font-medium text-ink-700">{usageLabel(offer)}</span>
                 </div>
 
                 <div className="mt-auto flex items-center gap-1.5 border-t border-ink-100 pt-3 text-[12px] text-ink-500">
@@ -315,6 +346,14 @@ export function Offers() {
                   >
                     Edit
                   </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={<Trash2 size={14} />}
+                    onClick={() => setDeleteTarget(offer)}
+                    aria-label="Delete offer"
+                    className="text-danger hover:bg-danger-surface"
+                  />
                 </div>
               </CardBody>
             </Card>
@@ -385,11 +424,53 @@ export function Offers() {
               placeholder="199"
             />
           </Field>
+          <div className="grid grid-cols-2 gap-4">
+            <Field label="Max discount (₹)" hint="Caps a percentage discount; blank = no cap">
+              <Input
+                type="number"
+                min={0}
+                value={form.maxDiscount}
+                onChange={(e) => setForm({ ...form, maxDiscount: e.target.value })}
+                placeholder="100"
+              />
+            </Field>
+            <Field label="Usage limit" hint="Total redemptions allowed; blank = unlimited">
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                value={form.usageLimit}
+                onChange={(e) => setForm({ ...form, usageLimit: e.target.value })}
+                placeholder="500"
+              />
+            </Field>
+          </div>
           <Field label="Expiry date" hint="Leave blank for no expiry">
             <Input type="date" value={form.expiresAt} onChange={(e) => setForm({ ...form, expiresAt: e.target.value })} />
           </Field>
         </div>
       </Drawer>
+
+      <Modal
+        open={deleteTarget !== null}
+        onClose={() => !deleting && setDeleteTarget(null)}
+        title="Delete offer"
+        footer={
+          <>
+            <Button variant="outline" onClick={() => setDeleteTarget(null)} disabled={deleting}>
+              Cancel
+            </Button>
+            <Button variant="danger" onClick={handleDelete} loading={deleting}>
+              Delete
+            </Button>
+          </>
+        }
+      >
+        <p className="text-sm text-ink-600">
+          Delete coupon <span className="font-mono font-semibold text-ink-800">{deleteTarget?.code}</span>? Customers will no
+          longer be able to apply it. This cannot be undone.
+        </p>
+      </Modal>
     </div>
   );
 }

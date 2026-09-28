@@ -10,9 +10,9 @@ import {
   Wallet,
   Landmark,
   BarChart3,
-  Bell,
   LifeBuoy,
   Settings,
+  Gift,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -20,7 +20,6 @@ export interface NavItem {
   label: string;
   to: string;
   icon: LucideIcon;
-  badge?: number;
 }
 
 export interface NavGroup {
@@ -46,6 +45,7 @@ export const navGroups: NavGroup[] = [
       { label: 'Orders', to: '/orders', icon: ShoppingBag },
       { label: 'Vendors', to: '/vendors', icon: Store },
       { label: 'Delivery Partners', to: '/drivers', icon: Bike },
+      { label: 'Driver Incentives', to: '/incentives', icon: Gift },
       { label: 'Customers', to: '/customers', icon: Users },
     ],
   },
@@ -66,13 +66,10 @@ export const navGroups: NavGroup[] = [
   },
   {
     label: 'Engagement',
-    items: [
-      { label: 'Notifications', to: '/notifications', icon: Bell },
-      { label: 'Support Tickets', to: '/support', icon: LifeBuoy },
-    ],
+    items: [{ label: 'Support Tickets', to: '/support', icon: LifeBuoy }],
   },
   {
     label: 'System',
-    items: [{ label: 'Settings', to: '/settings', icon: Settings }],
+    items: [{ label: 'Platform Config', to: '/settings', icon: Settings }],
   },
 ];

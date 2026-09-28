@@ -41,14 +41,16 @@ export function Badge({
   );
 }
 
-const ORDER_STATUS_TONE: Record<string, Tone> = {
+// Every status value the backend actually produces: orders, vendor/driver/customer
+// accounts, KYC + step reviews, products (incl. stock-derived), coupons, payout
+// batches, driver payout buckets, support tickets and incentives.
+const STATUS_TONE: Record<string, Tone> = {
   placed: 'info',
   accepted: 'violet',
   preparing: 'orange',
   ready_for_pickup: 'teal',
   out_for_delivery: 'indigo',
   delivered: 'success',
-  completed: 'success',
   cancelled: 'neutral',
   failed: 'danger',
   active: 'success',
@@ -56,13 +58,9 @@ const ORDER_STATUS_TONE: Record<string, Tone> = {
   suspended: 'danger',
   rejected: 'danger',
   verified: 'success',
-  online: 'success',
-  offline: 'neutral',
-  'on-delivery': 'info',
   blocked: 'danger',
   paid: 'success',
   processing: 'info',
-  scheduled: 'info',
   expired: 'neutral',
   paused: 'warning',
   draft: 'neutral',
@@ -70,14 +68,14 @@ const ORDER_STATUS_TONE: Record<string, Tone> = {
   'low-stock': 'warning',
   'out-of-stock': 'danger',
   open: 'warning',
-  'in-progress': 'info',
+  in_progress: 'info',
   resolved: 'success',
   escalated: 'danger',
 };
 
 export function StatusBadge({ status, label }: { status: string; label?: string }) {
-  const tone = ORDER_STATUS_TONE[status] ?? 'neutral';
-  const text = label ?? status.replace(/-/g, ' ');
+  const tone = STATUS_TONE[status] ?? 'neutral';
+  const text = label ?? status.replace(/[-_]/g, ' ');
   return (
     <Badge tone={tone} dot className="capitalize">
       {text}

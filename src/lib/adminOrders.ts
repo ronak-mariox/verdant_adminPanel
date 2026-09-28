@@ -1,7 +1,7 @@
 // Shared backend-order shape + mapping logic used by both Orders.tsx (list) and
 // OrderDetail.tsx (detail view) so the two pages agree on how a real /admin/orders
 // record is turned into the admin panel's local Order type.
-import type { Order, OrderItem, OrderStatus, OrderStatusEvent } from '@/types';
+import type { Order, OrderItem, OrderStatus, OrderStatusEvent, PaymentMethod } from '@/types';
 import { ApiError } from '@/lib/api';
 import { resolveAssetUrl } from '@/lib/asset';
 
@@ -59,7 +59,7 @@ export interface ApiOrder {
   statusHistory: ApiOrderStatusEvent[];
   specialInstructions?: string;
   cancelReason?: string;
-  cancelledBy?: 'customer' | 'vendor' | 'admin';
+  cancelledBy?: 'customer' | 'vendor' | 'admin' | 'driver';
   placedAt: string;
   deliveredAt?: string;
   createdAt: string;
@@ -99,11 +99,18 @@ function formatAddress(address: ApiOrderAddress): string {
   return [address.line1, address.line2, address.city, address.state, address.pincode].filter(Boolean).join(', ');
 }
 
+const PAYMENT_METHOD_LABEL: Record<ApiOrder['paymentMethod'], PaymentMethod> = {
+  cod: 'Cash on Delivery',
+  online: 'Online',
+};
+
+const EMPTY_DRIVERS = new Map<string, ApiDriver>();
+
 export function mapOrder(
   o: ApiOrder,
   customerById: Map<string, ApiCustomer>,
   vendorById: Map<string, ApiVendor>,
-  driverById: Map<string, ApiDriver>,
+  driverById: Map<string, ApiDriver> = EMPTY_DRIVERS,
 ): Order {
   const customer = customerById.get(o.customerId);
   const vendor = vendorById.get(o.vendorId);
@@ -120,14 +127,15 @@ export function mapOrder(
   const statusHistory: OrderStatusEvent[] = o.statusHistory.map((event) => ({
     status: event.status,
     time: event.at,
+    note: event.note,
   }));
 
   return {
     id: o.id,
     orderNumber: o.orderNumber,
     customerId: o.customerId,
-    customerName: customer?.name || customer?.phone || 'Unknown customer',
-    customerPhone: customer?.phone ?? '—',
+    customerName: customer?.name || customer?.phone || o.address.contactName || 'Unknown customer',
+    customerPhone: customer?.phone ?? o.address.contactPhone ?? '—',
     vendorId: o.vendorId,
     vendorName: vendor ? vendorDisplayName(vendor) : 'Unknown vendor',
     driverId: o.driverId,
@@ -139,8 +147,7 @@ export function mapOrder(
     platformFee: o.pricing.platformFee,
     discount: o.pricing.discount,
     total: o.pricing.grandTotal,
-    // Backend only supports COD today (no payment gateway wired up yet) — always real, never fabricated.
-    paymentMethod: 'Cash on Delivery',
+    paymentMethod: PAYMENT_METHOD_LABEL[o.paymentMethod] ?? 'Cash on Delivery',
     paymentStatus: o.paymentStatus,
     status: o.status,
     address: formatAddress(o.address),
@@ -148,6 +155,7 @@ export function mapOrder(
     placedAt: o.placedAt,
     statusHistory,
     cancelReason: o.cancelReason,
+    cancelledBy: o.cancelledBy,
   };
 }
 

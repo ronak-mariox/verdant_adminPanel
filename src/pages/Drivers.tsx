@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Users, CheckCircle2, Star, ShieldAlert, Bike, PackageSearch, Loader2, AlertTriangle } from 'lucide-react';
+import { Users, CheckCircle2, ShieldAlert, Bike, PackageSearch, Loader2, AlertTriangle, Ban } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Card } from '@/components/ui/Card';
 import { StatCard } from '@/components/ui/StatCard';
@@ -13,9 +13,10 @@ import { Button } from '@/components/ui/Button';
 import { Pagination } from '@/components/ui/Pagination';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { InlineAlert } from '@/components/ui/InlineAlert';
+import { ReasonModal } from '@/components/ui/ReasonModal';
 import type { Driver, DriverStatus, KycStatus } from '@/types';
-import { formatCurrency } from '@/lib/format';
-import { api, ApiError } from '@/lib/api';
+import { api, ApiError, buildQuery } from '@/lib/api';
+import { useDebounce } from '@/lib/useDebounce';
 import { avatarColorFor } from '@/lib/avatarColor';
 
 const STATUS_TABS: { value: DriverStatus | 'all'; label: string }[] = [
@@ -47,6 +48,8 @@ interface ApiDriver {
   email?: string;
   status: DriverStatus;
   kycStatus: KycStatus;
+  registrationStep?: string;
+  rejectionReason?: string;
   vehicleType?: 'motorbike' | 'scooter' | 'bicycle' | 'other';
   vehicleDetails?: { registrationNumber?: string };
   address?: { city?: string };
@@ -71,18 +74,14 @@ function mapDriver(d: ApiDriver): Driver {
     zone: d.address?.city ?? '—',
     status: d.status,
     kycStatus: d.kycStatus,
-    // No ratings, delivery counts or earnings data server-side yet (and no
-    // driver-assignment/payout system wired up to compute them from orders on
-    // this list page without an N+1 fetch) — always 0, never fabricated.
-    rating: 0,
-    totalDeliveries: 0,
-    completionRate: 0,
-    earningsThisMonth: 0,
+    registrationStep: d.registrationStep ?? '',
+    rejectionReason: d.rejectionReason,
     joinedAt: d.createdAt,
   };
 }
 
 export function Drivers() {
+  const [allDrivers, setAllDrivers] = useState<ApiDriver[]>([]);
   const [apiDrivers, setApiDrivers] = useState<ApiDriver[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -93,6 +92,23 @@ export function Drivers() {
   const [vehicleFilter, setVehicleFilter] = useState('all');
   const [statusTab, setStatusTab] = useState<DriverStatus | 'all'>('all');
   const [page, setPage] = useState(1);
+  const [rejectTarget, setRejectTarget] = useState<Driver | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  const debouncedSearch = useDebounce(search.trim(), 300);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<ApiDriver[]>('/admin/drivers')
+      .then((data) => {
+        if (!cancelled) setAllDrivers(data);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -100,7 +116,8 @@ export function Drivers() {
       setLoading(true);
       setLoadError(null);
       try {
-        const data = await api.get<ApiDriver[]>('/admin/drivers');
+        const qs = buildQuery({ status: statusTab === 'all' ? undefined : statusTab, search: debouncedSearch || undefined });
+        const data = await api.get<ApiDriver[]>(`/admin/drivers${qs}`);
         if (!cancelled) setApiDrivers(data);
       } catch (err) {
         if (!cancelled) setLoadError(errorMessage(err, 'Failed to load delivery partners'));
@@ -112,81 +129,65 @@ export function Drivers() {
     return () => {
       cancelled = true;
     };
-  }, [reloadKey]);
+  }, [reloadKey, statusTab, debouncedSearch]);
 
   const drivers = useMemo(() => apiDrivers.map(mapDriver), [apiDrivers]);
 
-  const totalDrivers = drivers.length;
-  const activeCount = drivers.filter((d) => d.status === 'active').length;
-  const avgRating = totalDrivers ? (drivers.reduce((sum, d) => sum + d.rating, 0) / totalDrivers).toFixed(1) : '0.0';
-  const pendingKyc = drivers.filter((d) => d.kycStatus === 'pending').length;
+  const totalDrivers = allDrivers.length;
+  const activeCount = allDrivers.filter((d) => d.status === 'active').length;
+  const suspendedCount = allDrivers.filter((d) => d.status === 'suspended').length;
+  const pendingKyc = allDrivers.filter((d) => d.kycStatus === 'pending').length;
 
-  const searchFiltered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return drivers.filter((d) => {
-      const matchesSearch =
-        !q ||
-        d.name.toLowerCase().includes(q) ||
-        d.phone.toLowerCase().includes(q) ||
-        d.zone.toLowerCase().includes(q);
-      const matchesVehicle = vehicleFilter === 'all' || d.vehicleType === vehicleFilter;
-      return matchesSearch && matchesVehicle;
-    });
-  }, [drivers, search, vehicleFilter]);
-
-  const statusCounts = useMemo(() => {
-    const counts: Record<string, number> = { all: searchFiltered.length };
-    (['pending', 'active', 'suspended', 'rejected'] as DriverStatus[]).forEach((s) => {
-      counts[s] = searchFiltered.filter((d) => d.status === s).length;
-    });
-    return counts;
-  }, [searchFiltered]);
-
-  const filtered = useMemo(() => {
-    if (statusTab === 'all') return searchFiltered;
-    return searchFiltered.filter((d) => d.status === statusTab);
-  }, [searchFiltered, statusTab]);
+  const filtered = useMemo(
+    () => (vehicleFilter === 'all' ? drivers : drivers.filter((d) => d.vehicleType === vehicleFilter)),
+    [drivers, vehicleFilter],
+  );
 
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const paged = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  const currentPage = Math.min(page, pageCount);
+  const paged = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
   const tabItems: TabItem[] = STATUS_TABS.map((t) => ({
     value: t.value,
     label: t.label,
-    count: statusCounts[t.value] ?? 0,
+    count: t.value === 'all' ? allDrivers.length : allDrivers.filter((d) => d.status === t.value).length,
   }));
 
-  // KYC approve/reject and the driver's overall account status are the same
-  // field group server-side (PATCH /admin/drivers/:id/status requires a
-  // status value from active/suspended/rejected — 'pending' isn't accepted back).
-  // For a driver still pending review, approving/rejecting their KYC is the same
-  // action as approving/rejecting the driver; for an already-active/suspended
-  // driver it just re-flags kycStatus while leaving their account status as-is.
-  async function setDriverKyc(driverId: string, kycStatus: 'verified' | 'rejected') {
-    const driver = drivers.find((d) => d.id === driverId);
-    if (!driver) return;
+  async function updateStatus(id: string, body: { status: DriverStatus; kycStatus?: KycStatus; rejectionReason?: string }) {
     setActionError(null);
+    setBusyId(id);
     try {
-      const nextStatus: DriverStatus =
-        driver.status === 'pending' ? (kycStatus === 'verified' ? 'active' : 'rejected') : driver.status;
-      const updated = await api.patch<ApiDriver>(`/admin/drivers/${driverId}/status`, {
-        status: nextStatus,
-        kycStatus,
-      });
-      setApiDrivers((prev) => prev.map((d) => (d.id === driverId ? updated : d)));
+      const updated = await api.patch<ApiDriver>(`/admin/drivers/${id}/status`, body);
+      setApiDrivers((prev) => prev.map((d) => (d.id === id ? updated : d)));
+      setAllDrivers((prev) => prev.map((d) => (d.id === id ? updated : d)));
+      setRejectTarget(null);
     } catch (err) {
-      setActionError(errorMessage(err, `Failed to ${kycStatus === 'verified' ? 'approve' : 'reject'} KYC`));
+      setActionError(errorMessage(err, 'Failed to update delivery partner'));
+    } finally {
+      setBusyId(null);
     }
   }
 
-  const approveKyc = (id: string) => setDriverKyc(id, 'verified');
-  const rejectKyc = (id: string) => setDriverKyc(id, 'rejected');
+  // Approving a pending driver's KYC activates the account; for an already
+  // active/suspended driver only the kycStatus flag changes.
+  function approveKyc(d: Driver) {
+    updateStatus(d.id, d.status === 'pending' ? { status: 'active' } : { status: d.status, kycStatus: 'verified' });
+  }
+
+  function rejectKyc(d: Driver, reason: string) {
+    updateStatus(
+      d.id,
+      d.status === 'pending'
+        ? { status: 'rejected', rejectionReason: reason }
+        : { status: d.status, kycStatus: 'rejected', rejectionReason: reason },
+    );
+  }
 
   return (
     <div>
       <PageHeader
         title="Delivery Partners"
-        subtitle="Monitor delivery partner account status, KYC status and performance"
+        subtitle="Monitor delivery partner account and KYC status"
       />
 
       {actionError && <InlineAlert message={actionError} className="mb-4" />}
@@ -207,16 +208,16 @@ export function Drivers() {
           iconSurface="var(--color-info-surface)"
         />
         <StatCard
-          label="Avg rating"
-          value={avgRating}
-          icon={<Star size={18} />}
+          label="Pending KYC"
+          value={pendingKyc}
+          icon={<ShieldAlert size={18} />}
           iconColor="#F79009"
           iconSurface="var(--color-warning-surface)"
         />
         <StatCard
-          label="Pending KYC"
-          value={pendingKyc}
-          icon={<ShieldAlert size={18} />}
+          label="Suspended"
+          value={suspendedCount}
+          icon={<Ban size={18} />}
           iconColor="#DC2626"
           iconSurface="var(--color-danger-surface)"
         />
@@ -236,7 +237,7 @@ export function Drivers() {
       <Card className="mt-4">
         <div className="flex flex-wrap items-center gap-3 border-b border-ink-100 px-5 py-4">
           <SearchInput
-            placeholder="Search by name, phone or zone…"
+            placeholder="Search by name or phone…"
             value={search}
             onChange={(e) => {
               setSearch(e.target.value);
@@ -279,83 +280,86 @@ export function Drivers() {
             <Thead>
               <Tr>
                 <Th>Driver</Th>
-                <Th>Zone</Th>
+                <Th>City</Th>
                 <Th>Vehicle</Th>
                 <Th>Status</Th>
                 <Th>KYC</Th>
-                <Th>Rating</Th>
-                <Th>Deliveries</Th>
-                <Th>Completion</Th>
-                <Th className="text-right">Earnings (month)</Th>
+                <Th>Registration</Th>
               </Tr>
             </Thead>
             <tbody>
-              {paged.map((d) => (
-                <Tr key={d.id}>
-                  <Td>
-                    <div className="flex items-center gap-3">
-                      <Avatar name={d.name} color={d.avatarColor} size={38} />
-                      <div className="min-w-0">
-                        <Link
-                          to={`/drivers/${d.id}`}
-                          className="block truncate font-semibold text-ink-800 hover:text-brand-700"
-                        >
-                          {d.name}
-                        </Link>
-                        <p className="text-[12.5px] text-ink-500">{d.phone}</p>
+              {paged.map((d) => {
+                const busy = busyId === d.id;
+                return (
+                  <Tr key={d.id}>
+                    <Td>
+                      <div className="flex items-center gap-3">
+                        <Avatar name={d.name} color={d.avatarColor} size={38} />
+                        <div className="min-w-0">
+                          <Link
+                            to={`/drivers/${d.id}`}
+                            className="block truncate font-semibold text-ink-800 hover:text-brand-700"
+                          >
+                            {d.name}
+                          </Link>
+                          <p className="text-[12.5px] text-ink-500">{d.phone}</p>
+                        </div>
                       </div>
-                    </div>
-                  </Td>
-                  <Td className="text-ink-600">{d.zone}</Td>
-                  <Td>
-                    <div className="flex items-center gap-1.5 text-ink-700">
-                      <Bike size={14} className="text-ink-400" />
-                      <span className="capitalize">{d.vehicleType}</span>
-                    </div>
-                    <p className="text-[12px] text-ink-500">{d.vehicleNumber}</p>
-                  </Td>
-                  <Td>
-                    <StatusBadge status={d.status} />
-                  </Td>
-                  <Td>
-                    <StatusBadge status={d.kycStatus} />
-                    {d.kycStatus === 'pending' && (
-                      <div className="mt-1.5 flex gap-1.5">
-                        <button
-                          onClick={() => approveKyc(d.id)}
-                          className="rounded-md bg-success-surface px-2 py-0.5 text-[11px] font-semibold text-success hover:bg-success/20"
-                        >
-                          Approve
-                        </button>
-                        <button
-                          onClick={() => rejectKyc(d.id)}
-                          className="rounded-md bg-danger-surface px-2 py-0.5 text-[11px] font-semibold text-danger hover:bg-danger/20"
-                        >
-                          Reject
-                        </button>
+                    </Td>
+                    <Td className="text-ink-600">{d.zone}</Td>
+                    <Td>
+                      <div className="flex items-center gap-1.5 text-ink-700">
+                        <Bike size={14} className="text-ink-400" />
+                        <span className="capitalize">{d.vehicleType}</span>
                       </div>
-                    )}
-                  </Td>
-                  <Td>
-                    <div className="flex items-center gap-1">
-                      <Star size={13} className="fill-warning text-warning" />
-                      <span className="font-medium text-ink-800">{d.rating}</span>
-                    </div>
-                  </Td>
-                  <Td className="text-ink-700">{d.totalDeliveries}</Td>
-                  <Td className="text-ink-700">{d.completionRate}%</Td>
-                  <Td className="text-right font-semibold text-ink-800">
-                    {formatCurrency(d.earningsThisMonth)}
-                  </Td>
-                </Tr>
-              ))}
+                      <p className="text-[12px] text-ink-500">{d.vehicleNumber}</p>
+                    </Td>
+                    <Td>
+                      <StatusBadge status={d.status} />
+                    </Td>
+                    <Td>
+                      <StatusBadge status={d.kycStatus} />
+                      {d.kycStatus === 'pending' && d.status !== 'rejected' && d.registrationStep !== 'submitted' && (
+                        <p className="mt-1.5 text-[11.5px] text-ink-500">Waiting for driver to finish registration</p>
+                      )}
+                      {d.kycStatus === 'pending' && d.status !== 'rejected' && d.registrationStep === 'submitted' && (
+                        <div className="mt-1.5 flex flex-wrap gap-1.5">
+                          <Link
+                            to={`/drivers/${d.id}`}
+                            className="rounded-md bg-ink-100 px-2 py-0.5 text-[11px] font-semibold text-ink-700 hover:bg-ink-200"
+                          >
+                            Review documents
+                          </Link>
+                          <button
+                            disabled={busy}
+                            onClick={() => approveKyc(d)}
+                            className="rounded-md bg-success-surface px-2 py-0.5 text-[11px] font-semibold text-success hover:bg-success/20 disabled:opacity-50"
+                          >
+                            Approve
+                          </button>
+                          <button
+                            disabled={busy}
+                            onClick={() => setRejectTarget(d)}
+                            className="rounded-md bg-danger-surface px-2 py-0.5 text-[11px] font-semibold text-danger hover:bg-danger/20 disabled:opacity-50"
+                          >
+                            Reject
+                          </button>
+                        </div>
+                      )}
+                    </Td>
+                    <Td className="text-[12.5px] text-ink-500">
+                      {d.status === 'pending' ? (d.registrationStep === 'submitted' ? 'Submitted' : 'In progress') : '—'}
+                    </Td>
+                  </Tr>
+                );
+              })}
             </tbody>
           </Table>
         )}
 
         {!loading && !loadError && (
           <Pagination
-            page={page}
+            page={currentPage}
             pageCount={pageCount}
             onChange={setPage}
             total={filtered.length}
@@ -363,6 +367,18 @@ export function Drivers() {
           />
         )}
       </Card>
+
+      <ReasonModal
+        open={rejectTarget !== null}
+        title={`Reject KYC for ${rejectTarget?.name ?? 'driver'}?`}
+        label="Reason for rejection"
+        hint="Shown to the driver so they know what to fix."
+        placeholder="e.g. Driving licence photo is unreadable"
+        confirmLabel="Reject"
+        busy={busyId !== null}
+        onClose={() => setRejectTarget(null)}
+        onConfirm={(reason) => rejectTarget && rejectKyc(rejectTarget, reason)}
+      />
     </div>
   );
 }

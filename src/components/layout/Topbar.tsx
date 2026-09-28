@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Bell, LifeBuoy, LogOut, Menu } from 'lucide-react';
 import { SearchInput } from '@/components/ui/Input';
@@ -21,6 +21,7 @@ export function Topbar({ onMenuClick }: { onMenuClick?: () => void }) {
   const navigate = useNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
+  const [query, setQuery] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
   const notifRef = useRef<HTMLDivElement>(null);
   const [tickets, setTickets] = useState<SupportTicketRecord[]>([]);
@@ -29,10 +30,12 @@ export function Topbar({ onMenuClick }: { onMenuClick?: () => void }) {
     let cancelled = false;
     async function load() {
       try {
-        const raw = await fetchAllPaginated<ApiSupportTicket>('/admin/support-tickets', { status: 'open' });
-        const escalatedRaw = await fetchAllPaginated<ApiSupportTicket>('/admin/support-tickets', { status: 'escalated' });
+        const [open, escalated] = await Promise.all([
+          fetchAllPaginated<ApiSupportTicket>('/admin/support-tickets', { status: 'open' }),
+          fetchAllPaginated<ApiSupportTicket>('/admin/support-tickets', { status: 'escalated' }),
+        ]);
         if (cancelled) return;
-        const all = [...raw, ...escalatedRaw].map(mapTicket).sort(
+        const all = [...open, ...escalated].map(mapTicket).sort(
           (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
         );
         setTickets(all);
@@ -65,6 +68,13 @@ export function Topbar({ onMenuClick }: { onMenuClick?: () => void }) {
     navigate('/login', { replace: true });
   }
 
+  function handleSearch(e: FormEvent) {
+    e.preventDefault();
+    const q = query.trim();
+    navigate(q ? `/orders?search=${encodeURIComponent(q)}` : '/orders');
+    setQuery('');
+  }
+
   const openTickets = tickets.length;
   const recentTickets = tickets.slice(0, 5);
 
@@ -74,9 +84,13 @@ export function Topbar({ onMenuClick }: { onMenuClick?: () => void }) {
         <Menu size={20} />
       </button>
 
-      <div className="min-w-0 flex-1 md:w-72 md:flex-none">
-        <SearchInput placeholder="Search orders, vendors, products…" />
-      </div>
+      <form className="min-w-0 flex-1 md:w-72 md:flex-none" onSubmit={handleSearch}>
+        <SearchInput
+          placeholder="Search orders by number, customer or vendor…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+      </form>
 
       <div className="flex-1" />
 
